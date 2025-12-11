@@ -1,0 +1,28 @@
+{
+  "name": "SQLite Performance",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "installOhMyZsh": true,
+      "upgradePackages": true
+    }
+  },
+
+  "postCreateCommand": "apt-get update && apt-get install -y sqlite3 && pip install --upgrade pip",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "alexcvzz.vscode-sqlite"
+      ]
+    }
+  },
+
+  "forwardPorts": [],
+  
+  "remoteUser": "vscode"
+}
