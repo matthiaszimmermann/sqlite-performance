@@ -46,6 +46,9 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
+# Mounted data directory
+data/
+
 # OS
 .DS_Store
 Thumbs.db

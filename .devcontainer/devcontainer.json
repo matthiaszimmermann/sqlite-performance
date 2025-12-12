@@ -23,6 +23,10 @@
     }
   },
 
+  "mounts": [
+    "source=${localEnv:HOME}/Documents/golem/arkiv/db,target=/workspaces/sqlite-performance/data,type=bind"
+  ],
+
   "forwardPorts": [],
   
   "remoteUser": "vscode"
