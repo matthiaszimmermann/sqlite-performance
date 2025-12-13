@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "SQLite performance testing and benchmarking"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "matplotlib>=3.10.8",
+    "pandas>=2.3.3",
+    "seaborn>=0.13.2",
+]
 
 [project.optional-dependencies]
 dev = [
