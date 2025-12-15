@@ -2,6 +2,32 @@
 
 This document captures benchmark results comparing insert performance across different index configurations.
 
+---
+
+## Table of Contents
+
+- [Executive Summary](#executive-summary)
+- [Test Configurations](#test-configurations)
+- [Experiment 2: File-Based Database (Large Batches)](#experiment-2-file-based-database-large-batches)
+- [Experiment 3: File-Based with Realistic Batch Size](#experiment-3-file-based-with-realistic-batch-size)
+- [Experiment 3b: File-Based with Individual Inserts (Arkiv-style)](#experiment-3b-file-based-with-individual-inserts-arkiv-style)
+- [Experiment 4: Insert Mode Comparison](#experiment-4-insert-mode-comparison)
+- [Analysis](#analysis)
+- [Experiment 5: Full Arkiv Schema with Realistic Payloads](#experiment-5-full-arkiv-schema-with-realistic-payloads)
+- [Experiment 6: Simple Schema (No Bi-temporality)](#experiment-6-simple-schema-no-bi-temporality)
+- [Experiment 6: Commit Time Analysis](#experiment-6-commit-time-analysis)
+- [Experiment 7: Memory/Cache Size Impact](#experiment-7-memorycache-size-impact)
+- [Experiment 8: Commit Time Analysis with Real Arkiv Data (Sampled Blocks)](#experiment-8-commit-time-analysis-with-real-arkiv-data-sampled-blocks)
+- [Experiment 9: Commit Time Analysis with Attribute Type Split](#experiment-9-commit-time-analysis-with-attribute-type-split)
+- [Experiment 10: Commit Time Analysis with Simple EAV Schema](#experiment-10-commit-time-analysis-with-simple-eav-schema)
+- [Running the Benchmarks](#running-the-benchmarks)
+- [Database Scaling: 2x, 5x, 10x Mendoza](#database-scaling-2x-5x-10x-mendoza)
+- [Read Performance: Measurement Points & Realistic Query Mixes](#read-performance-measurement-points--realistic-query-mixes)
+- [Performance Testing Strategy: Scaling & Read/Write Limits](#performance-testing-strategy-scaling--readwrite-limits)
+- [Data Center Benchmark: Controlled Test Environment](#data-center-benchmark-controlled-test-environment)
+
+---
+
 ## Executive Summary
 
 ### Key Conclusions
@@ -730,3 +756,1037 @@ uv run python -m db.09_benchmark_sampled_blocks data/arkiv-data-mendoza.db "" da
 # Experiment 10: Commit time analysis with simple EAV schema
 uv run python -m db.10_benchmark_sampled_blocks_simple_eav data/arkiv-data-mendoza.db "" data/sampled_50k_simple_eav.db 50000
 ```
+
+---
+
+## Database Scaling: 2x, 5x, 10x Mendoza
+
+This section details how to generate scaled databases for performance testing.
+
+### Target Scale Points
+
+| Scale | Entities | Rows | DB Size | Index Size (est) | Generation Time |
+|-------|----------|------|---------|------------------|-----------------|
+| **1x** (mendoza) | 800K | 20M | 13 GB | ~5 GB | baseline |
+| **2x** | 1.6M | 40M | 27 GB | ~10 GB | ~2-3 hours |
+| **5x** | 4.0M | 100M | 67 GB | ~25 GB | ~5-6 hours |
+| **10x** | 8.0M | 200M | 133 GB | ~50 GB | ~10-12 hours |
+
+### Scaling Approach Options
+
+#### Option A: Duplicate with Fresh Entity Keys
+
+The simplest approach — copy mendoza data N times with regenerated entity keys.
+
+**Pros:**
+- Fast to implement
+- Preserves attribute distributions exactly
+- Entity lifecycle patterns preserved (43% persistent, 56% ephemeral)
+
+**Cons:**
+- Artificial entity key distribution (clumped by generation batch)
+- No temporal spread — all duplicates have similar block ranges
+- May not stress B-tree splits realistically
+
+**Method:**
+```python
+# For each entity in mendoza:
+#   1. Generate new random entity_key (32 bytes)
+#   2. Copy all string_attributes with new key
+#   3. Copy all numeric_attributes with new key
+#   4. Copy payload with new key
+#   5. Optionally offset from_block/to_block to spread temporally
+```
+
+#### Option B: Temporal Extension
+
+Extend the block range (currently ~1.15M blocks / 27 days) to simulate longer operation.
+
+**Pros:**
+- Realistic temporal distribution
+- Better tests bi-temporal query patterns
+- Simulates long-running production database
+
+**Cons:**
+- Doesn't test entity density at same block height
+- Complex to maintain attribute version chains correctly
+
+**Method:**
+```python
+# Extend block range from 1.15M to 11.5M blocks (10x = ~270 days)
+# Distribute new entities across extended range
+# Maintain from_block/to_block relationships
+```
+
+#### Option C: Hybrid (Recommended)
+
+Combine both approaches for realistic scaling.
+
+**Method:**
+```python
+# 1. Duplicate entities with fresh keys (N-1 copies)
+# 2. Spread new entities temporally:
+#    - 2x: blocks 1.15M → 2.3M
+#    - 5x: blocks 1.15M → 5.75M
+#    - 10x: blocks 1.15M → 11.5M
+# 3. Maintain realistic attribute update patterns:
+#    - 43% of new entities: long-lived (to_block = max)
+#    - 56% of new entities: ephemeral (to_block = from_block + random(5min-5hr))
+```
+
+### Implementation: `11_generate_scaled_db.py`
+
+```python
+"""
+Generate scaled databases (2x, 5x, 10x mendoza) for performance testing.
+
+Usage:
+    uv run python -m db.11_generate_scaled_db mendoza.db 2x scaled_2x.db
+    uv run python -m db.11_generate_scaled_db mendoza.db 5x scaled_5x.db
+    uv run python -m db.11_generate_scaled_db mendoza.db 10x scaled_10x.db
+"""
+
+import secrets
+from dataclasses import dataclass
+
+@dataclass
+class ScaleConfig:
+    multiplier: int
+    block_offset_per_copy: int  # blocks to offset each copy
+    
+SCALE_CONFIGS = {
+    "2x": ScaleConfig(2, 1_150_000),    # ~27 days per copy
+    "5x": ScaleConfig(5, 1_150_000),
+    "10x": ScaleConfig(10, 1_150_000),
+}
+
+def generate_fresh_entity_key() -> bytes:
+    """Generate random 32-byte entity key."""
+    return secrets.token_bytes(32)
+
+def copy_entity_with_offset(
+    src_cursor, dst_cursor, 
+    old_key: bytes, new_key: bytes,
+    block_offset: int
+):
+    """Copy all data for an entity with new key and block offset."""
+    
+    # Copy string_attributes
+    src_cursor.execute("""
+        SELECT from_block, to_block, key, value
+        FROM string_attributes WHERE entity_key = ?
+    """, (old_key,))
+    for row in src_cursor:
+        from_b, to_b, key, value = row
+        # Update system keys
+        if key == "$key":
+            value = "0x" + new_key.hex()
+        dst_cursor.execute("""
+            INSERT INTO string_attributes 
+            (entity_key, from_block, to_block, key, value)
+            VALUES (?, ?, ?, ?, ?)
+        """, (new_key, from_b + block_offset, to_b + block_offset, key, value))
+    
+    # Copy numeric_attributes (similar)
+    # Copy payloads (similar, update cached $key in JSON)
+```
+
+### Verification Queries
+
+After generating scaled DBs, verify data integrity:
+
+```sql
+-- Entity count
+SELECT COUNT(DISTINCT entity_key) FROM string_attributes;
+
+-- Row counts
+SELECT 
+    (SELECT COUNT(*) FROM string_attributes) as str_attrs,
+    (SELECT COUNT(*) FROM numeric_attributes) as num_attrs,
+    (SELECT COUNT(*) FROM payloads) as payloads;
+
+-- Block range
+SELECT MIN(from_block), MAX(to_block) FROM string_attributes;
+
+-- Entity key uniqueness
+SELECT COUNT(*), COUNT(DISTINCT entity_key) FROM payloads;
+```
+
+### Disk Space Requirements
+
+| Scale | DB Size | Working Copy | Analysis Scripts | Total |
+|-------|---------|--------------|------------------|-------|
+| 1x | 13 GB | — | 2 GB | 15 GB |
+| 2x | 27 GB | 27 GB | 2 GB | 56 GB |
+| 5x | 67 GB | 67 GB | 2 GB | 136 GB |
+| 10x | 133 GB | 133 GB | 2 GB | 268 GB |
+
+**Recommendation:** Use SSD with ≥500 GB free space for 10x testing.
+
+---
+
+## Read Performance: Measurement Points & Realistic Query Mixes
+
+### Measurement Points
+
+#### Reads: Entities/sec
+
+| Metric | Measurement | SQL Pattern |
+|--------|-------------|-------------|
+| **Entity fetch** | Complete entity retrieval | Join string + numeric attrs + payload by entity_key |
+| **Attribute scan** | Entities matching criteria | WHERE key=? AND value=? on string_attributes |
+| **Historical query** | Entity state at block N | WHERE entity_key=? AND from_block <= N AND to_block > N |
+
+**Entity fetch benchmark:**
+```sql
+-- Full entity at current state (to_block = max)
+SELECT s.key, s.value 
+FROM string_attributes s
+WHERE s.entity_key = ? AND s.to_block = 9223372036854775807;
+
+SELECT n.key, n.value 
+FROM numeric_attributes n
+WHERE n.entity_key = ? AND n.to_block = 9223372036854775807;
+
+SELECT payload, content_type 
+FROM payloads 
+WHERE entity_key = ? AND to_block = 9223372036854775807;
+```
+
+#### Writes: Rows/sec and Entities/sec
+
+| Metric | Measurement | Notes |
+|--------|-------------|-------|
+| **Rows/sec** | Raw INSERT throughput | Best for comparing DB engines |
+| **Entities/sec** | Full entity commits | Includes ~25 rows + payload per entity |
+
+**Entity write composition (based on mendoza averages):**
+- 15 string attributes → 15 INSERT
+- 9 numeric attributes → 9 INSERT  
+- 1 payload (~5KB) → 1 INSERT
+- **Total: ~25 rows per entity**
+
+At ~6,400 rows/sec → **~256 entities/sec** (mendoza baseline)
+
+### Realistic Read Mix Proposals
+
+Based on mendoza entity types and scenarios.md use cases, here are 3 read mix profiles:
+
+#### Mix A: "Data Center Workload"
+
+Simulates decentralized compute network operations (100K nodes, 500K workloads).
+
+| Query Type | Weight | SQL Pattern | Rationale |
+|------------|--------|-------------|-----------|
+| **Node status lookup** | 30% | `entity_key = ?` on string_attrs | Check node availability |
+| **Workload by status** | 25% | `key='status' AND value='pending'` | Find workloads to schedule |
+| **Nodes by resource** | 20% | `key='allocatable_gpu' AND value > ?` | Find capable nodes |
+| **Creator lookup** | 10% | `key='$creator' AND value=?` | Find tenant's entities |
+| **Historical state** | 10% | `entity_key=? AND from_block<=? AND to_block>?` | Audit trail |
+| **Payload fetch** | 5% | `SELECT payload WHERE entity_key=?` | Get config blobs |
+
+**Characteristics:**
+- Point lookups dominate (55%)
+- Moderate attribute scans (45%)
+- Historical queries rare (10%)
+- Small result sets expected
+
+#### Mix B: "Governance/Voting Platform"
+
+Simulates DAO voting with proposal→vote relationships (from mendoza CivicCommit data).
+
+| Query Type | Weight | SQL Pattern | Rationale |
+|------------|--------|-------------|-----------|
+| **Get proposal** | 20% | `entity_key = ?` | View proposal details |
+| **Votes for proposal** | 25% | `key='proposalKey' AND value=?` | Count/list votes |
+| **User's votes** | 15% | `key='$creator' AND value=?` on votes | User voting history |
+| **Active proposals** | 15% | `key='status' AND value='active'` | List open votes |
+| **Proposal by type** | 10% | `key='type' AND value='proposal'` | Filter by entity type |
+| **Historical state** | 10% | `from_block<=? AND to_block>?` | Audit/dispute resolution |
+| **Full entity fetch** | 5% | All attrs + payload | Detailed view |
+
+**Characteristics:**
+- Relationship queries dominate (40% = votes for proposal + user's votes)
+- Type-based filtering common (25%)
+- Historical queries for auditability (10%)
+- Larger result sets (votes for proposal)
+
+#### Mix C: "IoT/Streaming Data"
+
+Simulates high-frequency sensor data or chunked media (from mendoza video-chunk, sensor_data).
+
+| Query Type | Weight | SQL Pattern | Rationale |
+|------------|--------|-------------|-----------|
+| **Latest N entities by type** | 30% | `key='type' AND value=? ORDER BY from_block DESC LIMIT N` | Recent sensor readings |
+| **Entity by key** | 20% | `entity_key = ?` | Fetch specific chunk |
+| **Chunks in sequence** | 15% | `key='nextBlockId' AND value=?` | Follow chunk chain |
+| **Time range query** | 15% | `from_block >= ? AND from_block < ?` | Data for time window |
+| **Payload fetch** | 15% | `SELECT payload WHERE entity_key=?` | Get binary chunk data |
+| **Creator's recent** | 5% | `key='$creator' AND value=? ORDER BY from_block DESC` | User's uploads |
+
+**Characteristics:**
+- Temporal queries dominate (45%)
+- Large payload fetches (15%)
+- Sequential access patterns (chunk chains)
+- High volume, low complexity queries
+
+### Read Mix Comparison
+
+| Aspect | Mix A: Data Center | Mix B: Governance | Mix C: IoT/Streaming |
+|--------|-------------------|-------------------|----------------------|
+| **Point lookups** | 55% | 25% | 35% |
+| **Attribute scans** | 35% | 55% | 35% |
+| **Temporal queries** | 10% | 10% | 45% |
+| **Payload heavy** | Low (5%) | Low (5%) | High (15%) |
+| **Result set size** | Small (1-10) | Medium (10-100) | Small-Medium |
+| **Index pressure** | `entity_key`, `key+value` | `key+value` heavy | `from_block` heavy |
+
+### Implementation: Query Generators
+
+```python
+"""Query generators for read benchmarks."""
+
+import random
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass 
+class QueryMix:
+    name: str
+    queries: list[tuple[float, Callable]]  # (weight, generator)
+
+def make_data_center_mix(entity_keys: list[bytes], creators: list[str]) -> QueryMix:
+    """Mix A: Data Center workload queries."""
+    return QueryMix(
+        name="data_center",
+        queries=[
+            (0.30, lambda: (
+                "SELECT key, value FROM string_attributes WHERE entity_key = ? AND to_block = 9223372036854775807",
+                (random.choice(entity_keys),)
+            )),
+            (0.25, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = 'status' AND value = 'pending' LIMIT 100",
+                ()
+            )),
+            (0.20, lambda: (
+                "SELECT DISTINCT entity_key FROM numeric_attributes WHERE key = 'allocatable_gpu' AND value > ? LIMIT 50",
+                (random.randint(0, 4),)
+            )),
+            (0.10, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = '$creator' AND value = ? LIMIT 100",
+                (random.choice(creators),)
+            )),
+            (0.10, lambda: (
+                "SELECT key, value FROM string_attributes WHERE entity_key = ? AND from_block <= ? AND to_block > ?",
+                (random.choice(entity_keys), random.randint(1, 1_000_000), random.randint(1, 1_000_000))
+            )),
+            (0.05, lambda: (
+                "SELECT payload FROM payloads WHERE entity_key = ? AND to_block = 9223372036854775807",
+                (random.choice(entity_keys),)
+            )),
+        ]
+    )
+
+def make_governance_mix(entity_keys: list[bytes], proposal_keys: list[str], creators: list[str]) -> QueryMix:
+    """Mix B: Governance/Voting workload queries."""
+    return QueryMix(
+        name="governance",
+        queries=[
+            (0.20, lambda: (
+                "SELECT key, value FROM string_attributes WHERE entity_key = ? AND to_block = 9223372036854775807",
+                (random.choice(entity_keys),)
+            )),
+            (0.25, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = 'proposalKey' AND value = ? LIMIT 500",
+                (random.choice(proposal_keys),)
+            )),
+            (0.15, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = '$creator' AND value = ? AND to_block = 9223372036854775807 LIMIT 100",
+                (random.choice(creators),)
+            )),
+            (0.15, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = 'status' AND value = 'active' LIMIT 100",
+                ()
+            )),
+            (0.10, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE key = 'type' AND value = 'proposal' LIMIT 100",
+                ()
+            )),
+            (0.10, lambda: (
+                "SELECT key, value FROM string_attributes WHERE entity_key = ? AND from_block <= ? AND to_block > ?",
+                (random.choice(entity_keys), random.randint(1, 1_000_000), random.randint(1, 1_000_000))
+            )),
+            (0.05, lambda: (
+                """SELECT s.key, s.value, n.key, n.value, p.payload
+                   FROM string_attributes s
+                   LEFT JOIN numeric_attributes n ON s.entity_key = n.entity_key AND n.to_block = 9223372036854775807
+                   LEFT JOIN payloads p ON s.entity_key = p.entity_key AND p.to_block = 9223372036854775807
+                   WHERE s.entity_key = ? AND s.to_block = 9223372036854775807""",
+                (random.choice(entity_keys),)
+            )),
+        ]
+    )
+
+def make_iot_streaming_mix(entity_keys: list[bytes], types: list[str], creators: list[str]) -> QueryMix:
+    """Mix C: IoT/Streaming workload queries."""
+    return QueryMix(
+        name="iot_streaming", 
+        queries=[
+            (0.30, lambda: (
+                "SELECT entity_key FROM string_attributes WHERE key = 'type' AND value = ? ORDER BY from_block DESC LIMIT 50",
+                (random.choice(types),)
+            )),
+            (0.20, lambda: (
+                "SELECT key, value FROM string_attributes WHERE entity_key = ? AND to_block = 9223372036854775807",
+                (random.choice(entity_keys),)
+            )),
+            (0.15, lambda: (
+                "SELECT entity_key FROM string_attributes WHERE key = 'nextBlockId' AND value = ?",
+                ("chunk_" + str(random.randint(1, 10000)),)
+            )),
+            (0.15, lambda: (
+                "SELECT DISTINCT entity_key FROM string_attributes WHERE from_block >= ? AND from_block < ? LIMIT 100",
+                (random.randint(0, 900_000), random.randint(100_000, 1_000_000))
+            )),
+            (0.15, lambda: (
+                "SELECT payload FROM payloads WHERE entity_key = ? AND to_block = 9223372036854775807",
+                (random.choice(entity_keys),)
+            )),
+            (0.05, lambda: (
+                "SELECT entity_key FROM string_attributes WHERE key = '$creator' AND value = ? ORDER BY from_block DESC LIMIT 20",
+                (random.choice(creators),)
+            )),
+        ]
+    )
+```
+
+### Benchmark Protocol
+
+```
+For each DB size (1x, 2x, 5x, 10x):
+  For each mix (A, B, C):
+    1. Warm up: 1000 queries (discard results)
+    2. Measure: 10000 queries
+       - Record latency for each query
+       - Calculate: p50, p95, p99, max
+       - Calculate: QPS (queries per second)
+    3. Cool down: 5 seconds
+    
+Report:
+  - QPS by mix and DB size
+  - Latency distribution by query type
+  - Index hit rates (if measurable)
+```
+
+### Expected Results Template
+
+| DB Size | Mix | QPS | p50 (ms) | p95 (ms) | p99 (ms) | Notes |
+|---------|-----|-----|----------|----------|----------|-------|
+| 1x | A: Data Center | — | — | — | — | |
+| 1x | B: Governance | — | — | — | — | |
+| 1x | C: IoT | — | — | — | — | |
+| 2x | A: Data Center | — | — | — | — | |
+| ... | ... | ... | ... | ... | ... | |
+
+---
+
+## Performance Testing Strategy: Scaling & Read/Write Limits
+
+This section outlines the systematic approach to determine arkiv's performance limits at scale.
+
+### Goals
+
+1. **Speed to reliable findings** — Minimize time to actionable performance data
+2. **Write limits at scale** — Measure write performance at 2x, 5x, 10x DB sizes (up to 133GB)
+3. **Read limits** — Probe maximum read rates for realistic query patterns
+4. **Combined limits** — Find sustainable read+write throughput with single-writer constraint
+
+### Team Assignments
+
+| Workstream | Owner | Duration | Deliverable |
+|------------|-------|----------|-------------|
+| **A: DB Generation** | SWE 1 | 2 days | 2x, 5x, 10x scaled databases |
+| **B: Write Load Testing** | Supplier Team | 4 days | Write-only performance at all scales |
+| **C: Read Benchmark** | SWE 2 | 3 days | Read-only performance at all scales |
+| **D: Combined Testing** | SWE 1 + SWE 2 | 2 days | Combined read+write limits |
+| **E: Analysis** | All | 1 day | Recommendations document |
+
+### Timeline
+
+```
+Day 1: SWE 1 generates 2x, 5x DBs
+       Supplier sets up test environment, discusses RAM config (8GB→16GB→32GB?)
+       SWE 2 designs query mix + implements read benchmark
+
+Day 2: SWE 1 generates 10x DB, hands off all DBs
+       Supplier runs write benchmark on 1x
+       SWE 2 runs read benchmark on 1x, 2x
+
+Day 3: SWE 1 available for support
+       Supplier runs write benchmark on 2x, 5x
+       SWE 2 runs read benchmark on 5x, 10x
+
+Day 4: Supplier runs write benchmark on 10x
+       Buffer / re-runs
+
+─── SYNC POINT ───
+
+Day 5: SWE 1 + SWE 2 implement combined benchmark (pair programming)
+       Supplier provides infrastructure support
+
+Day 6: Combined tests on 2x, 5x, 10x DBs
+       SWE 1: 2x, 5x | SWE 2: 10x
+
+Day 7: Analysis and recommendations (all hands)
+```
+
+### Workstream A: DB Generation (SWE 1)
+
+**Target Scale Points:**
+
+| Scale | Entities | Rows | DB Size | Generation Time |
+|-------|----------|------|---------|-----------------|
+| 1x (mendoza) | 800K | 20M | 13 GB | baseline |
+| 2x | 1.6M | 40M | 27 GB | ~2-3 hours |
+| 5x | 4.0M | 100M | 67 GB | ~5-6 hours |
+| 10x | 8.0M | 200M | 133 GB | ~10-12 hours |
+
+**Method:** Extend `08_benchmark_sampled_blocks.py` to:
+- Random sample blocks from mendoza
+- Generate fresh entity keys (avoid conflicts)
+- Append to create larger DBs incrementally (2x → 5x → 10x)
+
+**Script:** `11_generate_scaled_db.py`
+
+### Workstream B: Write Load Testing (Supplier Team)
+
+**Environment:** Full node + DB setup (production-like)
+
+**RAM Configuration Discussion:**
+
+| DB Size | Index Size (est) | Min RAM | Recommended RAM |
+|---------|------------------|---------|-----------------|
+| 1x (13GB) | ~5GB | 8GB | 16GB |
+| 2x (27GB) | ~10GB | 16GB | 16GB |
+| 5x (67GB) | ~25GB | 16GB | 32GB |
+| 10x (133GB) | ~50GB | 32GB | 64GB |
+
+**Key Question:** Current 8GB may be insufficient. Test at 16GB and 32GB to find sweet spot.
+
+**Metrics to Capture:**
+
+| Metric | Target | Failure Threshold |
+|--------|--------|-------------------|
+| Commit latency p50 | <500ms | >2000ms (misses block) |
+| Commit latency p99 | <1500ms | >2000ms |
+| Commit latency max | <2000ms | >3000ms |
+| Rows/sec throughput | >5000 | <2000 |
+
+**Checkpoint Considerations:**
+
+WAL checkpoints can cause latency spikes. Monitor and tune:
+
+```sql
+-- Increase checkpoint threshold to reduce frequency
+PRAGMA wal_autocheckpoint = 10000;  -- ~40MB WAL before checkpoint
+```
+
+Or use manual PASSIVE checkpoints between blocks.
+
+### Workstream C: Read Benchmark (SWE 2)
+
+**Query Mix** (based on mendoza data + use cases):
+
+| Query Type | % of Mix | SQL Pattern | Expected Use |
+|------------|----------|-------------|--------------|
+| Entity lookup | 40% | `WHERE entity_key = ?` | Get entity state |
+| Attribute scan | 20% | `WHERE key = ? AND value = ?` | Find by type/status |
+| Creator lookup | 15% | `WHERE key = '$creator' AND value = ?` | Find by owner |
+| Block range | 15% | `WHERE from_block <= ? AND to_block > ?` | Historical queries |
+| Payload fetch | 10% | `SELECT payload WHERE entity_key = ?` | Get binary data |
+
+**Test Matrix:**
+
+| DB Size | Connections | Target QPS Range |
+|---------|-------------|------------------|
+| 1x, 2x, 5x, 10x | 1 | 100 → 10K |
+| 1x, 2x, 5x, 10x | 10 | 100 → 10K |
+
+**Script:** `12_read_benchmark.py`
+
+### Workstream D: Combined Read+Write Testing
+
+**Protocol:**
+
+```
+For each DB size (2x, 5x, 10x):
+  1. Baseline: writes only, measure commit latency
+  2. Light reads: writes + 100 QPS reads
+  3. Medium reads: writes + 1K QPS reads
+  4. Heavy reads: writes + 5K QPS reads
+  5. Find ceiling: binary search for max reads where writes stay <2sec
+```
+
+**Script:** `13_combined_benchmark.py`
+
+### Verification Checklist
+
+**Memory/Caching:**
+
+| Check | Command/Method | Target |
+|-------|----------------|--------|
+| Index in RAM? | `vmtouch -v db.file` | >95% resident |
+| Cache misses? | `iostat` during benchmark | <10 reads/sec |
+| Checkpoint stalls? | Log p99/max latency | No commits >500ms |
+| WAL growth? | Monitor WAL file size | <100MB typical |
+
+**Pre-load DB into OS cache:**
+```bash
+vmtouch -t arkiv-data-mendoza.db  # Touch all pages
+# Or: cat db.file > /dev/null
+```
+
+### Success Criteria
+
+The experiments succeed if we can answer:
+
+| Question | Data Needed |
+|----------|-------------|
+| Max writes at 10x? | rows/sec, latency p99 |
+| Max reads at 10x? | QPS, latency p99 |
+| Combined sweet spot? | X writes/sec + Y reads/sec |
+| Degradation curve? | Performance vs DB size chart |
+| V1 feasibility? | Go/no-go for Data Center (621K entities, 10K-50K writes/sec, 1K-10K reads/sec) |
+
+### Potential Optimizations to Test
+
+If baseline results are insufficient:
+
+| Optimization | Expected Impact | Trade-off |
+|--------------|-----------------|-----------|
+| **Reduce indexes** (13→6) | ~30-40% write speedup | Slower reads on some patterns |
+| **Increase RAM** | Fewer cache misses | Cost |
+| **Tune checkpoints** | Fewer latency spikes | Larger WAL, longer recovery |
+| **Drop bi-temporal** | ~20% write speedup | Lose historical queries |
+| **Cap writes/block** | Predictable latency | Lower throughput |
+
+### Scripts Needed
+
+| Script | Owner | Purpose |
+|--------|-------|---------|
+| `11_generate_scaled_db.py` | SWE 1 | Generate 2x, 5x, 10x DBs |
+| `12_read_benchmark.py` | SWE 2 | Read-only performance testing |
+| `13_combined_benchmark.py` | SWE 1 + SWE 2 | Combined read+write testing |
+| `14_analyze_results.py` | Any | Generate charts and recommendations |
+
+### SQLite Alternatives
+
+If SQLite optimizations prove insufficient, consider these alternatives in order:
+
+| # | Database | Days | Rationale |
+|---|----------|------|-----------|
+| 1 | **libSQL** | 1-2 | Drop-in SQLite replacement, specifically targets checkpoint storms. Lowest migration risk. |
+| 2 | **Embedded Postgres** | 3-5 | Proven at scale, background checkpoints, MVCC. Accept heavier footprint. |
+| 3 | **DuckDB** | 2-3 | Append-only model fits DELETE+INSERT pattern. Worth validating for our workload. |
+
+**Skip:**
+- **LMDB / RocksDB** — KV-only, no SQL. Would require building custom query engine.
+
+#### Success Criteria
+
+```
+p99 commit latency <500ms at 5x mendoza scale (67GB DB)
+with sustained mendoza-like write load (~6K rows/sec)
+```
+
+#### Key Validation Test
+
+Simulate entity update workload (worst case for B-tree reorganization):
+
+```
+Reorg simulation:
+  - DELETE 500 rows (existing PKs)
+  - INSERT 500 rows (same PKs, new values)
+  - Repeat for 1 hour
+
+Measure:
+  - p99 latency (must stay <500ms)
+  - Storage bloat over time
+  - Checkpoint/vacuum impact
+```
+
+#### Alternative Details
+
+**libSQL (Turso)**
+- Fork of SQLite with improved WAL handling
+- Same API/bindings as SQLite — minimal code changes
+- Specifically designed to reduce checkpoint storms
+- Go: `github.com/tursodatabase/libsql-client-go/libsql`
+
+**Embedded Postgres**
+- Run Postgres as subprocess managed by application
+- Go: `github.com/fergusstrange/embedded-postgres`
+- Key advantage: **Background checkpoint workers** — checkpoints don't block commits
+
+| Aspect | SQLite | Embedded Postgres |
+|--------|--------|-------------------|
+| Checkpoint | Blocks commit path | Background process (async) |
+| Binaries | ~1MB | ~100-150MB |
+| RAM (base) | ~10MB | ~100-200MB |
+| Startup | ~0ms | ~1-3 seconds |
+| Deployment | Single file | Data directory + processes |
+
+Postgres tuning for embedded use:
+```sql
+shared_buffers = 256MB
+checkpoint_timeout = 5min
+checkpoint_completion_target = 0.9
+max_wal_size = 1GB
+```
+
+**DuckDB**
+- Columnar, append-optimized storage
+- Different architecture might avoid B-tree reorg issues
+- Optimized for OLAP (bulk loads) — OLTP performance unknown
+- Go: `github.com/marcboeker/go-duckdb`
+
+#### Decision Tree
+
+```
+SQLite p99 latency <500ms at 5x scale?
+├─ YES → Stay with SQLite
+└─ NO → Test libSQL (1-2 days)
+         │
+         libSQL works? → Done (minimal migration)
+         ↓ No
+         Test Embedded Postgres (3-5 days)
+         │
+         Postgres works? → Accept operational overhead
+         ↓ No
+         Test DuckDB (2-3 days)
+         │
+         DuckDB works? → Unexpected win
+         ↓ No
+         Revisit architecture (sharding, async writes, etc.)
+```
+
+---
+
+## Data Center Benchmark: Controlled Test Environment
+
+This section describes a controlled benchmark environment using synthetic Data Center data, enabling verifiable read/write performance testing at scale.
+
+### Motivation
+
+| Problem with Mendoza-only | Solution with Controlled Data |
+|---------------------------|-------------------------------|
+| Can't verify query results | **Know** expected results (deterministic IDs) |
+| Random entity sampling | Query data we created |
+| Generic query patterns | Use-case-specific patterns |
+| Hard to isolate DC workload | DC data as distinct, queryable subset |
+
+### Data Model: 4 Entity Types
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Data Center Model                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   Node (100K per DC)              Workload (500K per DC)    │
+│   ├── dc_id ◄─────────────────────┤── dc_id                 │
+│   ├── region                       ├── status               │
+│   ├── status                       ├── assigned_node ──────►│
+│   ├── vm_type                      ├── region               │
+│   ├── cpu_count                    ├── vm_type              │
+│   ├── ram_gb                       ├── req_cpu              │
+│   ├── price_hour                   ├── req_ram              │
+│   └── avail_hours                  └── max_hours            │
+│         │                                │                  │
+│         ▼                                ▼                  │
+│   NodeEvent                        WorkloadEvent            │
+│   ├── node_id ──────────────────►  ├── workload_id ────────►│
+│   ├── event_type                   ├── event_type           │
+│   ├── old_status                   ├── old_status           │
+│   ├── new_status                   ├── new_status           │
+│   └── block                        └── block                │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Entity Attributes
+
+#### Node (4 string + 4 numeric + 10KB payload)
+
+| Attribute | Type | Values | Purpose |
+|-----------|------|--------|---------|
+| `dc_id` | string | `dc_01` ... `dc_21` | Data center identifier |
+| `region` | string | `eu-west`, `us-east`, `asia-pac` | Geographic filtering |
+| `status` | string | `available`, `busy`, `offline` | Schedulability |
+| `vm_type` | string | `cpu`, `gpu`, `gpu_large` | Capability matching |
+| `cpu_count` | numeric | 4, 8, 16, 32 | Resource filtering |
+| `ram_gb` | numeric | 16, 32, 64, 128 | Resource filtering |
+| `price_hour` | numeric | 50-500 (cents) | Cost optimization |
+| `avail_hours` | numeric | 1, 4, 8, 24, 168 | Availability window |
+| payload | blob | 10 KB random | Config/metadata blob |
+
+#### Workload (5 string + 3 numeric + 10KB payload)
+
+| Attribute | Type | Values | Purpose |
+|-----------|------|--------|---------|
+| `dc_id` | string | `dc_01` ... `dc_21` | Data center scope |
+| `status` | string | `pending`, `running`, `completed`, `failed` | Lifecycle |
+| `assigned_node` | string | `node_000001` or empty | Relationship |
+| `region` | string | `eu-west`, `us-east`, `any` | Placement constraint |
+| `vm_type` | string | `cpu`, `gpu`, `gpu_large` | Required capability |
+| `req_cpu` | numeric | 1, 2, 4, 8 | Resource request |
+| `req_ram` | numeric | 4, 8, 16, 32 | Resource request |
+| `max_hours` | numeric | 1, 2, 4, 8, 24 | Max runtime |
+| payload | blob | 10 KB random | Job spec blob |
+
+### Deterministic ID Scheme
+
+```python
+# Nodes: node_{dc}_{n:06d}
+def node_id(dc: int, n: int) -> str:
+    return f"node_{dc:02d}_{n:06d}"  # e.g., node_07_000042
+
+# Workloads: wl_{dc}_{w:06d}
+def workload_id(dc: int, w: int) -> str:
+    return f"wl_{dc:02d}_{w:06d}"    # e.g., wl_07_000123
+
+# Derived relationships (deterministic):
+def workload_node(dc: int, w: int) -> str:
+    """Workload w is assigned to node (w % 100000) + 1 in same DC."""
+    n = (w % 100000) + 1
+    return node_id(dc, n)
+
+# So we KNOW:
+#   wl_07_000001 → node_07_000001
+#   wl_07_100001 → node_07_000001 (5 workloads per node)
+#   wl_07_000042 → node_07_000042
+```
+
+### Scale Points via Data Centers
+
+| Target | DCs | Nodes | Workloads | Entities | Est. Size |
+|--------|-----|-------|-----------|----------|-----------|
+| **~1x mendoza** | 2 | 200K | 1M | 1.2M | ~13 GB |
+| **~2x mendoza** | 4 | 400K | 2M | 2.4M | ~27 GB |
+| **~5x mendoza** | 11 | 1.1M | 5.5M | 6.6M | ~67 GB |
+| **~10x mendoza** | 21 | 2.1M | 10.5M | 12.6M | ~133 GB |
+
+Each DC contributes ~6.3 GB (100K nodes + 500K workloads × ~10.5 KB each).
+
+### Query Patterns (Verifiable)
+
+All queries scope to a single DC, testing index selectivity at scale:
+
+| Query | SQL Pattern | Expected Result |
+|-------|-------------|-----------------|
+| **Nodes in DC** | `dc_id = 'dc_07' AND type = 'node'` | Exactly 100K |
+| **Available GPU nodes** | `dc_id = 'dc_07' AND status = 'available' AND vm_type = 'gpu'` | ~17.5K (70% avail × 25% GPU) |
+| **Workloads on node** | `assigned_node = 'node_07_000042'` | Exactly 5 |
+| **Pending workloads** | `dc_id = 'dc_07' AND status = 'pending'` | ~75K (15% of 500K) |
+| **Node-workload match** | Multi-filter (see below) | Computable |
+
+#### Workload→Node Matching Query
+
+```sql
+-- Find available nodes in DC 07 that can run a GPU workload for 8 hours
+SELECT DISTINCT s1.entity_key 
+FROM string_attributes s1
+WHERE s1.key = 'type' AND s1.value = 'node'
+  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'dc_id' AND value = 'dc_07')
+  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'status' AND value = 'available')
+  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'vm_type' AND value = 'gpu')
+  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'cpu_count' AND value >= 4)
+  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'ram_gb' AND value >= 16)
+  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
+              AND key = 'avail_hours' AND value >= 8);
+```
+
+### Scripts
+
+#### Script 1: `src/db/generate_dc_seed.py` — Initial State
+
+Creates the "day 0" snapshot with all nodes and workloads. Implemented in `src/db/generate_dc_seed.py`.
+
+**Usage:**
+
+```bash
+# Small test run (300 entities, ~0.5 MB)
+uv run python -m src.db.generate_dc_seed \
+  --datacenters 1 \
+  --nodes-per-dc 100 \
+  --workloads-per-node 2 \
+  --payload-size 1000 \
+  --output data/dc_test.db
+
+# 2x mendoza scale (~27 GB)
+uv run python -m src.db.generate_dc_seed \
+  --datacenters 4 \
+  --nodes-per-dc 100000 \
+  --workloads-per-node 5 \
+  --payload-size 10000 \
+  --output data/dc_seed_2x.db
+
+# Add DC data to existing mendoza database
+uv run python -m src.db.generate_dc_seed \
+  --input data/arkiv-data-mendoza.db \
+  --datacenters 2 \
+  --nodes-per-dc 100000 \
+  --workloads-per-node 5 \
+  --output data/mendoza_plus_dc.db
+```
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--input, -i` | (empty DB) | Input database to copy from (optional) |
+| `--output, -o` | required | Output database path |
+| `--datacenters, -d` | 1 | Number of data centers |
+| `--nodes-per-dc, -n` | 100000 | Nodes per data center |
+| `--workloads-per-node, -w` | 5.0 | Workloads per node ratio (0.2–10) |
+| `--payload-size, -p` | 10000 | Payload size in bytes per entity |
+| `--seed, -s` | 42 | Random seed for reproducibility |
+| `--batch-size, -b` | 1000 | Commit batch size |
+
+**Output:**
+- N × 100K Node entities (per DC)
+- N × 500K Workload entities (per DC, at 5 workloads/node)
+- No events (clean initial state)
+- Single starting block
+
+**Architecture:**
+
+```
+generate_dc_seed.py
+├── Distribution helpers (encapsulated)
+│   ├── get_region_distribution()      → 40% eu-west, 35% us-east, 25% asia-pac
+│   ├── get_vm_type_distribution()     → 70% cpu, 25% gpu, 5% gpu_large
+│   ├── get_node_status_distribution() → 70% available, 25% busy, 5% offline
+│   └── get_workload_status_distribution() → 15% pending, 80% running, 5% completed
+│
+├── ID generation (deterministic)
+│   ├── make_dc_id(dc_num)             → "dc_01", "dc_02", ...
+│   ├── make_node_id(dc, n)            → "node_01_000042"
+│   ├── make_workload_id(dc, w)        → "wl_01_000123"
+│   └── make_entity_key(id, seed)      → 32-byte deterministic key
+│
+├── Entity creation (high-level)
+│   ├── create_node()                  → NodeEntity dataclass
+│   └── create_workload()              → WorkloadEntity dataclass
+│
+├── SQL conversion (lowest level)
+│   ├── node_to_sql_inserts()          → [(sql, params), ...]
+│   └── workload_to_sql_inserts()      → [(sql, params), ...]
+│
+└── Top-level functions
+    ├── generate_all_nodes()           → Insert all nodes with progress
+    └── generate_all_workloads()       → Insert all workloads with progress
+```
+
+**Distributions:**
+
+| Attribute | Distribution |
+|-----------|--------------|
+| `region` | 40% eu-west, 35% us-east, 25% asia-pac |
+| `vm_type` | 70% cpu, 25% gpu, 5% gpu_large |
+| `status` (node) | 70% available, 25% busy, 5% offline |
+| `status` (workload) | 15% pending, 80% running, 5% completed |
+| `cpu_count` | 30% 4-core, 30% 8-core, 25% 16-core, 15% 32-core |
+| `ram_gb` | 25% 16GB, 30% 32GB, 30% 64GB, 15% 128GB |
+| `price_hour` | Uniform 50–500 cents |
+| `avail_hours` | 10% 1h, 20% 4h, 25% 8h, 25% 24h, 20% 168h |
+
+**Verification:**
+
+```sql
+-- Check entity counts
+SELECT 'Nodes:', COUNT(DISTINCT entity_key) 
+FROM string_attributes WHERE key='type' AND value='node';
+
+SELECT 'Workloads:', COUNT(DISTINCT entity_key) 
+FROM string_attributes WHERE key='type' AND value='workload';
+
+-- Check distributions
+SELECT value, COUNT(*) FROM string_attributes 
+WHERE key='status' GROUP BY value;
+
+-- Check workload→node relationships
+SELECT s1.value as workload_id, s2.value as assigned_node
+FROM string_attributes s1
+JOIN string_attributes s2 ON s1.entity_key = s2.entity_key
+WHERE s1.key = 'workload_id' AND s2.key = 'assigned_node' AND s2.value != ''
+LIMIT 10;
+```
+
+#### Script 2: `generate_dc_load.py` — Ongoing Operations (TODO)
+
+Generates realistic churn: status changes, new workloads, completions.
+
+```bash
+uv run python -m db.generate_dc_load \
+  --input data/dc_seed_2x.db \
+  --output data/dc_load_2x.db \
+  --blocks 10000 \
+  --events-per-block 100 \
+  --seed 42
+```
+
+**Per-block event mix:**
+
+| Event Type | % | Description |
+|------------|---|-------------|
+| Node status change | 10% | available↔busy↔offline + NodeEvent |
+| New workload | 30% | Create pending workload |
+| Workload assigned | 20% | pending→running + set assigned_node |
+| Workload completed | 30% | running→completed + WorkloadEvent |
+| Workload failed | 10% | running→failed + WorkloadEvent |
+
+### Benchmark Combinations
+
+#### Write Performance
+
+| Mix | Composition | Tests |
+|-----|-------------|-------|
+| **Mendoza-only** | 100% sampled mendoza | Baseline (existing) |
+| **DC-only** | 100% DC load events | Pure use-case writes |
+| **DC-light** | 30% DC + 70% mendoza | DC as minority workload |
+| **DC-heavy** | 70% DC + 30% mendoza | DC as dominant workload |
+
+#### Read Performance
+
+Against known DC data with verifiable results:
+
+| Query Type | Weight | Verifiable? |
+|------------|--------|-------------|
+| Nodes by DC | 25% | ✅ Exactly 100K per DC |
+| Available nodes | 20% | ✅ ~70K per DC |
+| Workloads on node | 20% | ✅ Exactly 5 |
+| Node-workload match | 20% | ✅ Computable |
+| Historical state | 15% | ✅ If events generated |
+
+#### Combined Read+Write
+
+```
+Phase 1: Load DC seed (offline, not timed)
+Phase 2: Start write load (DC events)
+Phase 3: Fire read queries against known DC data
+Phase 4: Verify results match expectations
+Phase 5: Record latencies for both reads and writes
+```
+
+### Next Steps
+
+1. ✅ **Implement `generate_dc_seed.py`** — Initial state generator (done)
+2. **Implement `generate_dc_load.py`** — Event stream generator for ongoing operations
+3. **Implement DC read benchmark** — Verifiable queries against known data
+4. **Run baseline tests** — DC-only at 2x scale to validate approach
+5. **Integrate with existing benchmarks** — Mix DC + mendoza for combined tests
