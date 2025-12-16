@@ -86,7 +86,69 @@ uv run python -m src.db.inspect_dc_db data/dc_test.db --json
 
 ---
 
-## Script 3: `generate_dc_load.py` — Load Generator (TODO)
+## Script 3: `append_dc_data.py` — Block-by-Block Data Appender
+
+Appends data to an existing database block-by-block, simulating realistic chain progression where each block contains nodes and their associated workloads together.
+
+### Usage
+
+```bash
+# Create new database with 100 blocks
+uv run python -m src.db.append_dc_data \
+  --blocks 100 \
+  --nodes-per-block 10 \
+  --workloads-per-node 3 \
+  --percentage-assigned 0.5 \
+  --payload-size 1000 \
+  --output data/dc_blocks.db
+
+# Append 50 more blocks to existing database
+uv run python -m src.db.append_dc_data \
+  --input data/dc_blocks.db \
+  --blocks 50 \
+  --nodes-per-block 10 \
+  --workloads-per-node 3 \
+  --percentage-assigned 0.8 \
+  --output data/dc_blocks_extended.db
+```
+
+### Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--input, -i` | (empty DB) | Input database to append to (optional) |
+| `--output, -o` | required | Output database path |
+| `--blocks, -b` | 100 | Number of blocks to generate |
+| `--nodes-per-block, -n` | 10 | Number of nodes created per block |
+| `--workloads-per-node, -w` | 3 | Workloads per node |
+| `--percentage-assigned` | 0.5 | Fraction of nodes marked "busy" with one assigned workload (0.0–1.0) |
+| `--payload-size, -p` | 10000 | Payload size in bytes per entity |
+| `--seed, -s` | random | Random seed (random if not provided) |
+| `--batch-size` | 1000 | Commit batch size |
+| `--memory, -m` | 2 | Memory allocation in GB for SQLite cache |
+
+### Block Composition
+
+Each block contains:
+- N nodes (controlled by `--nodes-per-block`)
+- N × W workloads (where W = `--workloads-per-node`)
+
+For assigned nodes (controlled by `--percentage-assigned`):
+- Node status is set to "busy"
+- First workload of that node has status "running" and `assigned_node` set to the node ID
+
+### Key Differences from `generate_dc_seed.py`
+
+| Feature | `generate_dc_seed.py` | `append_dc_data.py` |
+|---------|----------------------|---------------------|
+| **Data generation** | Bulk (all nodes, then all workloads) | Block-by-block (nodes + workloads together) |
+| **Use case** | Initial "day 0" snapshot | Simulating chain progression |
+| **Entity IDs** | Sequential (`node_01_000001`) | UUID-based (`node_f1a57af1645c`) |
+| **Assignment control** | Random distribution | Explicit `--percentage-assigned` |
+
+---
+
+## Script 4: `generate_dc_load.py` — Load Generator (TODO)
 
 Generates realistic churn: status changes, new workloads, completions.
 

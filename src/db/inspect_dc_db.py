@@ -268,6 +268,58 @@ def inspect_database(db_path: str) -> dict:
     stats["workload_ttl_min"] = row[0] if row and row[0] is not None else None
     stats["workload_ttl_max"] = row[1] if row and row[1] is not None else None
     
+    # Count busy nodes (status = 'busy')
+    cursor.execute("""
+        SELECT COUNT(*) FROM string_attributes sa1
+        WHERE sa1.key = 'status' AND sa1.value = 'busy'
+        AND EXISTS (
+            SELECT 1 FROM string_attributes sa2 
+            WHERE sa2.entity_key = sa1.entity_key 
+            AND sa2.key = 'type' AND sa2.value = 'node'
+        )
+    """)
+    stats["num_busy_nodes"] = cursor.fetchone()[0]
+    
+    # Count running workloads (status = 'running')
+    cursor.execute("""
+        SELECT COUNT(*) FROM string_attributes sa1
+        WHERE sa1.key = 'status' AND sa1.value = 'running'
+        AND EXISTS (
+            SELECT 1 FROM string_attributes sa2 
+            WHERE sa2.entity_key = sa1.entity_key 
+            AND sa2.key = 'type' AND sa2.value = 'workload'
+        )
+    """)
+    stats["num_running_workloads"] = cursor.fetchone()[0]
+    
+    # Calculate percentages
+    if stats["num_nodes"] > 0:
+        stats["pct_busy_nodes"] = (stats["num_busy_nodes"] / stats["num_nodes"]) * 100
+    else:
+        stats["pct_busy_nodes"] = 0.0
+    
+    if stats["num_workloads"] > 0:
+        stats["pct_running_workloads"] = (stats["num_running_workloads"] / stats["num_workloads"]) * 100
+    else:
+        stats["pct_running_workloads"] = 0.0
+    
+    # Block statistics
+    cursor.execute("SELECT COUNT(DISTINCT from_block) FROM payloads")
+    stats["num_blocks"] = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT MIN(from_block), MAX(from_block) FROM payloads")
+    row = cursor.fetchone()
+    stats["min_block"] = row[0] if row and row[0] is not None else 0
+    stats["max_block"] = row[1] if row and row[1] is not None else 0
+    
+    # Nodes per block and workloads per block
+    if stats["num_blocks"] > 0:
+        stats["nodes_per_block"] = stats["num_nodes"] / stats["num_blocks"]
+        stats["workloads_per_block"] = stats["num_workloads"] / stats["num_blocks"]
+    else:
+        stats["nodes_per_block"] = 0.0
+        stats["workloads_per_block"] = 0.0
+    
     # Get random example entities
     stats["example_node"] = get_random_entity(conn, "node")
     stats["example_workload"] = get_random_entity(conn, "workload")
@@ -321,9 +373,18 @@ def print_report(db_path: str, stats: dict):
             dc_list += f", ... (+{len(stats['datacenters']) - 10} more)"
         print(f"  IDs:                 {dc_list}")
     print(f"Nodes:                 {stats['num_nodes']:,}")
+    print(f"  Busy:                {stats['num_busy_nodes']:,} ({stats['pct_busy_nodes']:.1f}%)")
     print(f"Workloads:             {stats['num_workloads']:,}")
+    print(f"  Running:             {stats['num_running_workloads']:,} ({stats['pct_running_workloads']:.1f}%)")
     print(f"Workloads/node ratio:  {stats['workloads_per_node']:.2f}")
     print(f"Total entities:        {stats['total_entities']:,}")
+    print()
+    
+    print("--- Block Statistics ---")
+    print(f"Number of blocks:      {stats['num_blocks']:,}")
+    print(f"Block range:           {stats['min_block']:,} - {stats['max_block']:,}")
+    print(f"Nodes/block:           {stats['nodes_per_block']:.2f}")
+    print(f"Workloads/block:       {stats['workloads_per_block']:.2f}")
     print()
     
     print("--- Attribute Statistics ---")

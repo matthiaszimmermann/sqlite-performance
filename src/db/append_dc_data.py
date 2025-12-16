@@ -1,32 +1,30 @@
 """
-Generate Data Center seed database for controlled benchmark testing.
+Append Data Center data block-by-block for realistic chain progression.
 
-Creates deterministic Node and Workload entities with configurable scale,
-enabling verifiable read/write performance testing.
+Creates Node and Workload entities in a block-by-block pattern where each block
+contains nodes and their associated workloads together.
+
+Block composition (for nodes-per-block=2, workloads-per-node=5):
+  - Node A + 5 workloads for Node A
+  - Node B + 5 workloads for Node B
+  - Total: 2 nodes + 10 workloads = 12 entities per block
 
 Usage:
-    # Create 2x mendoza scale (~27 GB) with 4 data centers
-    uv run python -m src.db.generate_dc_seed \
-        --datacenters 4 \
-        --nodes-per-dc 100000 \
+    # Append 1000 blocks to existing database
+    uv run python -m src.db.append_dc_data \
+        --input data/dc_seed.db \
+        --blocks 1000 \
+        --nodes-per-block 2 \
         --workloads-per-node 5 \
-        --payload-size 10000 \
-        --output data/dc_seed_2x.db
+        --output data/dc_extended.db
 
-    # Add DC data to existing mendoza database
-    uv run python -m src.db.generate_dc_seed \
-        --input data/arkiv-data-mendoza.db \
-        --datacenters 2 \
-        --nodes-per-dc 100000 \
-        --workloads-per-node 5 \
-        --output data/mendoza_plus_dc.db
-
-    # Small test run
-    uv run python -m src.db.generate_dc_seed \
-        --datacenters 1 \
-        --nodes-per-dc 1000 \
-        --workloads-per-node 2 \
-        --output data/dc_test.db
+    # Create new database with block-by-block data
+    uv run python -m src.db.append_dc_data \
+        --blocks 500 \
+        --nodes-per-block 3 \
+        --workloads-per-node 4 \
+        --percentage-assigned 0.8 \
+        --output data/dc_blocks.db
 """
 
 import argparse
@@ -299,8 +297,13 @@ def create_node(
     payload_size: int,
     block: int,
     seed: int,
+    status: str | None = None,
 ) -> NodeEntity:
-    """Create a single Node entity with randomized attributes."""
+    """Create a single Node entity with randomized attributes.
+    
+    Args:
+        status: If provided, use this status instead of sampling from distribution.
+    """
     rng = random.Random(f"{seed}:node:{dc_num}:{node_num}")
     
     dc_id = make_dc_id(dc_num)
@@ -309,7 +312,8 @@ def create_node(
     
     # Sample attributes from distributions
     region = sample_from_distribution(rng, get_region_distribution())
-    status = sample_from_distribution(rng, get_node_status_distribution())
+    if status is None:
+        status = sample_from_distribution(rng, get_node_status_distribution())
     vm_type = sample_from_distribution(rng, get_vm_type_distribution())
     cpu_count = sample_from_distribution(rng, get_cpu_count_distribution())
     ram_gb = sample_from_distribution(rng, get_ram_gb_distribution())
@@ -345,8 +349,15 @@ def create_workload(
     payload_size: int,
     block: int,
     seed: int,
+    status: str | None = None,
+    assigned_node: str | None = None,
 ) -> WorkloadEntity:
-    """Create a single Workload entity with randomized attributes."""
+    """Create a single Workload entity with randomized attributes.
+    
+    Args:
+        status: If provided, use this status instead of sampling from distribution.
+        assigned_node: If provided, use this as the assigned node ID.
+    """
     rng = random.Random(f"{seed}:workload:{dc_num}:{workload_num}")
     
     dc_id = make_dc_id(dc_num)
@@ -354,7 +365,8 @@ def create_workload(
     entity_key = make_entity_key(workload_id, seed)
     
     # Sample attributes from distributions
-    status = sample_from_distribution(rng, get_workload_status_distribution())
+    if status is None:
+        status = sample_from_distribution(rng, get_workload_status_distribution())
     region = sample_from_distribution(rng, get_region_distribution())
     vm_type = sample_from_distribution(rng, get_vm_type_distribution())
     req_cpu = sample_from_distribution(rng, get_req_cpu_distribution())
@@ -362,12 +374,13 @@ def create_workload(
     max_hours = sample_from_distribution(rng, get_max_hours_distribution())
     ttl_blocks = sample_ttl_blocks(rng)
 
-    # Assign to node (only if running, pending workloads are unassigned)
-    if status == "running":
-        node_num = workload_to_node_num(workload_num, nodes_per_dc)
-        assigned_node = make_node_id(dc_num, node_num, seed)
-    else:
-        assigned_node = ""
+    # Use provided assigned_node or determine based on status
+    if assigned_node is None:
+        if status == "running":
+            node_num = workload_to_node_num(workload_num, nodes_per_dc)
+            assigned_node = make_node_id(dc_num, node_num, seed)
+        else:
+            assigned_node = ""
     
     # Generate random payload
     payload = bytes(rng.getrandbits(8) for _ in range(payload_size))
@@ -390,55 +403,102 @@ def create_workload(
 
 
 # =============================================================================
-# Entity Generators (iterate over all entities)
+# Block-by-Block Entity Generation
 # =============================================================================
 
-def generate_nodes(
-    num_datacenters: int,
-    nodes_per_dc: int,
+@dataclass
+class BlockData:
+    """Data for a single block containing nodes and their workloads."""
+    block_num: int
+    nodes: list[NodeEntity]
+    workloads: list[WorkloadEntity]
+
+
+def generate_blocks(
+    num_blocks: int,
     nodes_per_block: int,
+    workloads_per_node: int,
+    percentage_assigned: float,
     payload_size: int,
     start_block: int,
     seed: int,
-) -> Iterator[NodeEntity]:
-    """Generate all Node entities across all data centers."""
-    node_counter = 0
-    current_block = start_block
-
-    for dc_num in range(1, num_datacenters + 1):
-        for node_num in range(1, nodes_per_dc + 1):
-            yield create_node(dc_num, node_num, payload_size, current_block, seed)
-
-            node_counter += 1
-            if node_counter >= nodes_per_block:
-                current_block += 1
-                node_counter = 0
-
-
-def generate_workloads(
-    num_datacenters: int,
-    nodes_per_dc: int,
-    workloads_per_node: float,
-    workloads_per_block: int,
-    payload_size: int,
-    start_block: int,
-    seed: int,
-) -> Iterator[WorkloadEntity]:
-    """Generate all Workload entities across all data centers."""
-    workloads_per_dc = int(nodes_per_dc * workloads_per_node)
-    workload_counter = 0
-    current_block = start_block
+    dc_num: int = 1,
+) -> Iterator[BlockData]:
+    """
+    Generate blocks with nodes and their associated workloads.
     
-    for dc_num in range(1, num_datacenters + 1):
-        for workload_num in range(1, workloads_per_dc + 1):
-            yield create_workload(
-                dc_num, workload_num, nodes_per_dc, payload_size, current_block, seed
+    Each block contains:
+    - N nodes (nodes_per_block)
+    - For each node: M workloads (workloads_per_node)
+    
+    Args:
+        num_blocks: Number of blocks to generate
+        nodes_per_block: Number of nodes per block
+        workloads_per_node: Number of workloads per node
+        percentage_assigned: Fraction of nodes that are busy (0.0-1.0)
+        payload_size: Size of payload in bytes
+        start_block: Starting block number
+        seed: Random seed
+        dc_num: Data center number (default: 1)
+    """
+    rng = random.Random(f"{seed}:blocks")
+    
+    # Global counters for unique IDs
+    node_counter = 0
+    workload_counter = 0
+    
+    for block_idx in range(num_blocks):
+        current_block = start_block + block_idx
+        nodes = []
+        workloads = []
+        
+        for _ in range(nodes_per_block):
+            node_counter += 1
+            
+            # Determine if this node is busy (has assigned workload)
+            is_busy = rng.random() < percentage_assigned
+            node_status = "busy" if is_busy else "available"
+            
+            # Create the node
+            node = create_node(
+                dc_num=dc_num,
+                node_num=node_counter,
+                payload_size=payload_size,
+                block=current_block,
+                seed=seed,
+                status=node_status,
             )
-
-            workload_counter += 1
-            if workload_counter >= workloads_per_block:
-                current_block += 1
-                workload_counter = 0    
+            nodes.append(node)
+            
+            # Create workloads for this node
+            for wl_idx in range(workloads_per_node):
+                workload_counter += 1
+                
+                # First workload is assigned if node is busy
+                if is_busy and wl_idx == 0:
+                    wl_status = "running"
+                    wl_assigned = node.node_id
+                else:
+                    wl_status = "pending"
+                    wl_assigned = ""
+                
+                workload = create_workload(
+                    dc_num=dc_num,
+                    workload_num=workload_counter,
+                    nodes_per_dc=node_counter,  # Not used when assigned_node provided
+                    payload_size=payload_size,
+                    block=current_block,
+                    seed=seed,
+                    status=wl_status,
+                    assigned_node=wl_assigned,
+                )
+                workloads.append(workload)
+        
+        yield BlockData(
+            block_num=current_block,
+            nodes=nodes,
+            workloads=workloads,
+        )
 
 
 # =============================================================================
@@ -748,94 +808,99 @@ def get_max_block(conn: sqlite3.Connection) -> int:
 # Top-Level Generation Functions
 # =============================================================================
 
-def generate_all_nodes(
+def append_blocks(
     conn: sqlite3.Connection,
-    num_datacenters: int,
-    nodes_per_dc: int,
+    num_blocks: int,
+    nodes_per_block: int,
+    workloads_per_node: int,
+    percentage_assigned: float,
     payload_size: int,
     start_block: int,
-    nodes_per_block: int,
     seed: int,
     creator_address: str = "0x0000000000000000000000000000000000dc0001",
-    batch_size: int = 1000000,
-) -> int:
+    batch_size: int = 1,
+) -> tuple[int, int, int]:
     """
-    Generate and insert all Node entities.
+    Generate and insert blocks with nodes and workloads together.
+    
+    Args:
+        conn: SQLite connection
+        num_blocks: Number of blocks to generate
+        nodes_per_block: Nodes per block
+        workloads_per_node: Workloads per node
+        percentage_assigned: Fraction of nodes that are busy (0.0-1.0)
+        payload_size: Payload size in bytes
+        start_block: Starting block number
+        seed: Random seed
+        creator_address: Creator address for entities
+        batch_size: Commit every N blocks (default: 1 = commit per block)
     
     Returns:
-        Total number of nodes created
+        Tuple of (node_count, workload_count, final_block)
     """
-    total_nodes = num_datacenters * nodes_per_dc
-    print(f"Generating {total_nodes:,} nodes ({num_datacenters} DCs × {nodes_per_dc:,} nodes)...")
+    entities_per_block = nodes_per_block + (nodes_per_block * workloads_per_node)
+    total_entities = num_blocks * entities_per_block
+    
+    print(f"Generating {num_blocks:,} blocks...")
+    print(f"  Nodes per block:      {nodes_per_block}")
+    print(f"  Workloads per node:   {workloads_per_node}")
+    print(f"  Entities per block:   {entities_per_block}")
+    print(f"  Total entities:       {total_entities:,}")
+    print(f"  Percentage assigned:  {percentage_assigned*100:.0f}%")
+    print()
     
     cursor = conn.cursor()
-    count = 0
+    node_count = 0
+    workload_count = 0
+    block_count = 0
+    final_block = start_block
     start_time = time.time()
     
-    for node in generate_nodes(num_datacenters, nodes_per_dc, nodes_per_block, payload_size, start_block, seed):
-        inserts = node_to_sql_inserts(node, creator_address)
-        for sql, params in inserts:
-            cursor.execute(sql, params)
-        
-        count += 1
-        if count % batch_size == 0:
-            conn.commit()
-            elapsed = time.time() - start_time
-            rate = count / elapsed
-            print(f"  Nodes: {count:,}/{total_nodes:,} ({100*count/total_nodes:.1f}%) - {rate:.0f} entities/sec - {datetime.now().strftime('%H:%M:%S')}")
-    
-    conn.commit()
-    elapsed = time.time() - start_time
-    print(f"  Completed {count:,} nodes in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec) - {datetime.now().strftime('%H:%M:%S')}")
-    
-    return count
-
-
-def generate_all_workloads(
-    conn: sqlite3.Connection,
-    num_datacenters: int,
-    nodes_per_dc: int,
-    workloads_per_node: float,
-    workloads_per_block: int,
-    payload_size: int,
-    start_block: int,
-    seed: int,
-    creator_address: str = "0x0000000000000000000000000000000000dc0002",
-    batch_size: int = 1000,
-) -> int:
-    """
-    Generate and insert all Workload entities.
-    
-    Returns:
-        Total number of workloads created
-    """
-    workloads_per_dc = int(nodes_per_dc * workloads_per_node)
-    total_workloads = num_datacenters * workloads_per_dc
-    print(f"Generating {total_workloads:,} workloads ({num_datacenters} DCs × {workloads_per_dc:,} workloads)...")
-    
-    cursor = conn.cursor()
-    count = 0
-    start_time = time.time()
-    
-    for workload in generate_workloads(
-        num_datacenters, nodes_per_dc, workloads_per_node, workloads_per_block, payload_size, start_block, seed
+    for block_data in generate_blocks(
+        num_blocks=num_blocks,
+        nodes_per_block=nodes_per_block,
+        workloads_per_node=workloads_per_node,
+        percentage_assigned=percentage_assigned,
+        payload_size=payload_size,
+        start_block=start_block,
+        seed=seed,
     ):
-        inserts = workload_to_sql_inserts(workload, creator_address)
-        for sql, params in inserts:
-            cursor.execute(sql, params)
+        # Insert all nodes in this block
+        for node in block_data.nodes:
+            inserts = node_to_sql_inserts(node, creator_address)
+            for sql, params in inserts:
+                cursor.execute(sql, params)
+            node_count += 1
         
-        count += 1
-        if count % batch_size == 0:
+        # Insert all workloads in this block
+        for workload in block_data.workloads:
+            inserts = workload_to_sql_inserts(workload, creator_address)
+            for sql, params in inserts:
+                cursor.execute(sql, params)
+            workload_count += 1
+        
+        block_count += 1
+        final_block = block_data.block_num
+        
+        # Commit every batch_size blocks
+        if block_count % batch_size == 0:
             conn.commit()
+        
+        # Progress every 100 blocks or 1000 entities
+        if block_count % 100 == 0 or (node_count + workload_count) % 1000 == 0:
             elapsed = time.time() - start_time
-            rate = count / elapsed
-            print(f"  Workloads: {count:,}/{total_workloads:,} ({100*count/total_workloads:.1f}%) - {rate:.0f} entities/sec - {datetime.now().strftime('%H:%M:%S')}")
+            rate = (node_count + workload_count) / elapsed if elapsed > 0 else 0
+            print(f"  Block {block_count:,}/{num_blocks:,} ({100*block_count/num_blocks:.1f}%) - "
+                  f"{node_count + workload_count:,} entities - {rate:.0f}/sec - "
+                  f"{datetime.now().strftime('%H:%M:%S')}")
     
     conn.commit()
     elapsed = time.time() - start_time
-    print(f"  Completed {count:,} workloads in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec) - {datetime.now().strftime('%H:%M:%S')}")
+    rate = (node_count + workload_count) / elapsed if elapsed > 0 else 0
+    print(f"  Completed {block_count:,} blocks in {elapsed:.1f}s ({rate:.0f} entities/sec) - "
+          f"{datetime.now().strftime('%H:%M:%S')}")
     
-    return count
+    return node_count, workload_count, final_block
 
 
 # =============================================================================
@@ -844,13 +909,13 @@ def generate_all_workloads(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate Data Center seed database for benchmark testing"
+        description="Append Data Center data block-by-block for realistic chain progression"
     )
     parser.add_argument(
         "--input", "-i",
         type=str,
         default=None,
-        help="Input database to copy from (optional, creates empty DB if not specified)"
+        help="Input database to append to (optional, creates empty DB if not specified)"
     )
     parser.add_argument(
         "--output", "-o",
@@ -859,22 +924,28 @@ def main():
         help="Output database path"
     )
     parser.add_argument(
-        "--datacenters", "-d",
+        "--blocks", "-b",
         type=int,
-        default=1,
-        help="Number of data centers (default: 1)"
+        default=100,
+        help="Number of blocks to generate (default: 100)"
     )
     parser.add_argument(
-        "--nodes-per-dc", "-n",
+        "--nodes-per-block",
         type=int,
-        default=100000,
-        help="Number of nodes per data center (default: 100000)"
+        default=DEFAULT_NODE_UPDATES_PER_BLOCK,
+        help=f"Number of nodes per block (default: {DEFAULT_NODE_UPDATES_PER_BLOCK})"
     )
     parser.add_argument(
         "--workloads-per-node", "-w",
+        type=int,
+        default=5,
+        help="Number of workloads per node (default: 5)"
+    )
+    parser.add_argument(
+        "--percentage-assigned", "-a",
         type=float,
-        default=5.0,
-        help="Workloads per node ratio, 0.2 to 10 (default: 5.0)"
+        default=0.8,
+        help="Fraction of nodes that are busy with one assigned workload (0.0-1.0, default: 0.8)"
     )
     parser.add_argument(
         "--payload-size", "-p",
@@ -889,27 +960,10 @@ def main():
         help="Random seed for reproducibility (default: random)"
     )
     parser.add_argument(
-        "--batch-size", "-b",
+        "--batch-size",
         type=int,
-        default=1000,
-        help="Commit batch size (default: 1000)"
-    )
-    parser.add_argument(
-        "--nodes-per-block",
-        type=int,
-        default=DEFAULT_NODE_UPDATES_PER_BLOCK,
-        help="Number of node entities created per block"
-    )
-    parser.add_argument(
-        "--workloads-per-block",
-        type=int,
-        default=DEFAULT_WORKLOAD_UPDATES_PER_BLOCK,
-        help="Number of workload entities created per block"
-    )
-    parser.add_argument(
-        "--no-indexes",
-        action="store_true",
-        help="Drop indexes before insert and recreate after (faster for bulk loads)"
+        default=1,
+        help="Commit every N blocks (default: 1 = commit per block)"
     )
     parser.add_argument(
         "--memory", "-m",
@@ -920,39 +974,42 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate workloads-per-node range
-    if not 0.2 <= args.workloads_per_node <= 10:
-        parser.error("--workloads-per-node must be between 0.2 and 10")
+    # Validate percentage-assigned range
+    if not 0.0 <= args.percentage_assigned <= 1.0:
+        parser.error("--percentage-assigned must be between 0.0 and 1.0")
     
     # Generate random seed if not provided
     if args.seed is None:
         args.seed = random.randint(1, 2**31 - 1)
     
-    print("=" * 60)
-    print("Data Center Seed Generator")
-    print("=" * 60)
-    print(f"Input:             {args.input or '(empty database)'}")
-    print(f"Output:            {args.output}")
-    print(f"Data centers:      {args.datacenters}")
-    print(f"Nodes per DC:      {args.nodes_per_dc:,}")
-    print(f"Workloads/node:    {args.workloads_per_node}")
-    print(f"Payload size:      {args.payload_size:,} bytes")
-    print(f"Seed:              {args.seed}")
-    print()
-    
-    # Calculate totals
-    total_nodes = args.datacenters * args.nodes_per_dc
-    total_workloads = args.datacenters * int(args.nodes_per_dc * args.workloads_per_node)
+    # Calculate derived values
+    entities_per_block = args.nodes_per_block + (args.nodes_per_block * args.workloads_per_node)
+    total_nodes = args.blocks * args.nodes_per_block
+    total_workloads = args.blocks * args.nodes_per_block * args.workloads_per_node
     total_entities = total_nodes + total_workloads
     
     # Estimate size: ~10.5 KB per entity with 10KB payload
     est_size_gb = total_entities * (args.payload_size + 500) / (1024**3)
     
+    print("=" * 60)
+    print("Data Center Block Appender")
+    print("=" * 60)
+    print(f"Input:              {args.input or '(empty database)'}")
+    print(f"Output:             {args.output}")
+    print(f"Blocks:             {args.blocks:,}")
+    print(f"Nodes per block:    {args.nodes_per_block}")
+    print(f"Workloads per node: {args.workloads_per_node}")
+    print(f"Entities per block: {entities_per_block}")
+    print(f"% assigned:         {args.percentage_assigned*100:.0f}%")
+    print(f"Payload size:       {args.payload_size:,} bytes")
+    print(f"Seed:               {args.seed}")
+    print()
+    
     print(f"Expected totals:")
-    print(f"  Nodes:           {total_nodes:,}")
-    print(f"  Workloads:       {total_workloads:,}")
-    print(f"  Total entities:  {total_entities:,}")
-    print(f"  Est. DB size:    ~{est_size_gb:.1f} GB")
+    print(f"  Nodes:            {total_nodes:,}")
+    print(f"  Workloads:        {total_workloads:,}")
+    print(f"  Total entities:   {total_entities:,}")
+    print(f"  Est. added size:  ~{est_size_gb:.1f} GB")
     print()
     
     # Initialize database
@@ -961,38 +1018,20 @@ def main():
     # Configure memory settings
     configure_memory(conn, args.memory)
     
-    # Drop indexes if --no-indexes flag is set (for faster bulk inserts)
-    if args.no_indexes:
-        drop_indexes(conn)
-        print()
-    
     # Get starting block (after existing data if any)
     start_block = get_max_block(conn) + 1
-    print(f"Starting block:    {start_block}")
+    print(f"Starting block:     {start_block}")
     print()
     
     # Generate data
     start_time = time.time()
     
-    node_count = generate_all_nodes(
+    node_count, workload_count, final_block = append_blocks(
         conn=conn,
-        num_datacenters=args.datacenters,
-        nodes_per_dc=args.nodes_per_dc,
+        num_blocks=args.blocks,
         nodes_per_block=args.nodes_per_block,
-        payload_size=args.payload_size,
-        start_block=start_block,
-        seed=args.seed,
-        batch_size=args.batch_size,
-    )
-    
-    print()
-    
-    workload_count = generate_all_workloads(
-        conn=conn,
-        num_datacenters=args.datacenters,
-        nodes_per_dc=args.nodes_per_dc,
         workloads_per_node=args.workloads_per_node,
-        workloads_per_block=args.workloads_per_block,
+        percentage_assigned=args.percentage_assigned,
         payload_size=args.payload_size,
         start_block=start_block,
         seed=args.seed,
@@ -1002,14 +1041,9 @@ def main():
     # Update last_block
     conn.execute(
         "INSERT OR REPLACE INTO last_block (id, block) VALUES (1, ?)",
-        (start_block,)
+        (final_block,)
     )
     conn.commit()
-    
-    # Recreate indexes if --no-indexes flag was set
-    if args.no_indexes:
-        print()
-        create_indexes(conn)
     
     total_time = time.time() - start_time
     
@@ -1021,6 +1055,8 @@ def main():
     print("=" * 60)
     print("Summary")
     print("=" * 60)
+    print(f"Blocks created:    {args.blocks:,}")
+    print(f"Block range:       {start_block:,} - {final_block:,}")
     print(f"Nodes created:     {node_count:,}")
     print(f"Workloads created: {workload_count:,}")
     print(f"Total entities:    {node_count + workload_count:,}")
