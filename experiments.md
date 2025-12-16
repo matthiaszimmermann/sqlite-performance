@@ -1022,7 +1022,7 @@ Simulates high-frequency sensor data or chunked media (from mendoza video-chunk,
 | **Chunks in sequence** | 15% | `key='nextBlockId' AND value=?` | Follow chunk chain |
 | **Time range query** | 15% | `from_block >= ? AND from_block < ?` | Data for time window |
 | **Payload fetch** | 15% | `SELECT payload WHERE entity_key=?` | Get binary chunk data |
-| **Creator's recent** | 5% | `key='$creator' AND value=? ORDER BY from_block DESC` | User's uploads |
+| **Creator's recent** | 5% | `key='$creator' AND value=? ORDER BY from_block DESC LIMIT 20` | User's uploads |
 
 **Characteristics:**
 - Temporal queries dominate (45%)
@@ -1182,11 +1182,9 @@ Report:
 
 | DB Size | Mix | QPS | p50 (ms) | p95 (ms) | p99 (ms) | Notes |
 |---------|-----|-----|----------|----------|----------|-------|
-| 1x | A: Data Center | — | — | — | — | |
-| 1x | B: Governance | — | — | — | — | |
-| 1x | C: IoT | — | — | — | — | |
-| 2x | A: Data Center | — | — | — | — | |
-| ... | ... | ... | ... | ... | ... | |
+| 1x, 2x, 5x, 10x | A: Data Center | — | — | — | — | |
+| 1x, 2x, 5x, 10x | B: Governance | — | — | — | — | |
+| 1x, 2x, 5x, 10x | C: IoT | — | — | — | — | |
 
 ---
 
@@ -1401,7 +1399,7 @@ with sustained mendoza-like write load (~6K rows/sec)
 
 #### Key Validation Test
 
-Simulate entity update workload (worst case for B-tree reorganization):
+Simulate entity update workload (worst case for B-tree reorg):
 
 ```
 Reorg simulation:
@@ -1595,160 +1593,17 @@ All queries scope to a single DC, testing index selectivity at scale:
 -- Find available nodes in DC 07 that can run a GPU workload for 8 hours
 SELECT DISTINCT s1.entity_key 
 FROM string_attributes s1
-WHERE s1.key = 'type' AND s1.value = 'node'
-  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'dc_id' AND value = 'dc_07')
-  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'status' AND value = 'available')
-  AND EXISTS (SELECT 1 FROM string_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'vm_type' AND value = 'gpu')
-  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'cpu_count' AND value >= 4)
-  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'ram_gb' AND value >= 16)
-  AND EXISTS (SELECT 1 FROM numeric_attributes WHERE entity_key = s1.entity_key 
-              AND key = 'avail_hours' AND value >= 8);
-```
-
-### Scripts
-
-#### Script 1: `src/db/generate_dc_seed.py` — Initial State
-
-Creates the "day 0" snapshot with all nodes and workloads. Implemented in `src/db/generate_dc_seed.py`.
-
-**Usage:**
-
-```bash
-# Small test run (300 entities, ~0.5 MB)
-uv run python -m src.db.generate_dc_seed \
-  --datacenters 1 \
-  --nodes-per-dc 100 \
-  --workloads-per-node 2 \
-  --payload-size 1000 \
-  --output data/dc_test.db
-
-# 2x mendoza scale (~27 GB)
-uv run python -m src.db.generate_dc_seed \
-  --datacenters 4 \
-  --nodes-per-dc 100000 \
-  --workloads-per-node 5 \
-  --payload-size 10000 \
-  --output data/dc_seed_2x.db
-
-# Add DC data to existing mendoza database
-uv run python -m src.db.generate_dc_seed \
-  --input data/arkiv-data-mendoza.db \
-  --datacenters 2 \
-  --nodes-per-dc 100000 \
-  --workloads-per-node 5 \
-  --output data/mendoza_plus_dc.db
-```
-
-**Parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--input, -i` | (empty DB) | Input database to copy from (optional) |
-| `--output, -o` | required | Output database path |
-| `--datacenters, -d` | 1 | Number of data centers |
-| `--nodes-per-dc, -n` | 100000 | Nodes per data center |
-| `--workloads-per-node, -w` | 5.0 | Workloads per node ratio (0.2–10) |
-| `--payload-size, -p` | 10000 | Payload size in bytes per entity |
-| `--seed, -s` | 42 | Random seed for reproducibility |
-| `--batch-size, -b` | 1000 | Commit batch size |
-
-**Output:**
-- N × 100K Node entities (per DC)
-- N × 500K Workload entities (per DC, at 5 workloads/node)
-- No events (clean initial state)
-- Single starting block
-
-**Architecture:**
-
-```
-generate_dc_seed.py
-├── Distribution helpers (encapsulated)
-│   ├── get_region_distribution()      → 40% eu-west, 35% us-east, 25% asia-pac
-│   ├── get_vm_type_distribution()     → 70% cpu, 25% gpu, 5% gpu_large
-│   ├── get_node_status_distribution() → 70% available, 25% busy, 5% offline
-│   └── get_workload_status_distribution() → 15% pending, 80% running, 5% completed
-│
-├── ID generation (deterministic)
-│   ├── make_dc_id(dc_num)             → "dc_01", "dc_02", ...
-│   ├── make_node_id(dc, n)            → "node_01_000042"
-│   ├── make_workload_id(dc, w)        → "wl_01_000123"
-│   └── make_entity_key(id, seed)      → 32-byte deterministic key
-│
-├── Entity creation (high-level)
-│   ├── create_node()                  → NodeEntity dataclass
-│   └── create_workload()              → WorkloadEntity dataclass
-│
-├── SQL conversion (lowest level)
-│   ├── node_to_sql_inserts()          → [(sql, params), ...]
-│   └── workload_to_sql_inserts()      → [(sql, params), ...]
-│
-└── Top-level functions
-    ├── generate_all_nodes()           → Insert all nodes with progress
-    └── generate_all_workloads()       → Insert all workloads with progress
-```
-
-**Distributions:**
-
-| Attribute | Distribution |
-|-----------|--------------|
-| `region` | 40% eu-west, 35% us-east, 25% asia-pac |
-| `vm_type` | 70% cpu, 25% gpu, 5% gpu_large |
-| `status` (node) | 70% available, 25% busy, 5% offline |
-| `status` (workload) | 15% pending, 80% running, 5% completed |
-| `cpu_count` | 30% 4-core, 30% 8-core, 25% 16-core, 15% 32-core |
-| `ram_gb` | 25% 16GB, 30% 32GB, 30% 64GB, 15% 128GB |
-| `price_hour` | Uniform 50–500 cents |
-| `avail_hours` | 10% 1h, 20% 4h, 25% 8h, 25% 24h, 20% 168h |
-
-**Verification:**
-
-```sql
--- Check entity counts
-SELECT 'Nodes:', COUNT(DISTINCT entity_key) 
-FROM string_attributes WHERE key='type' AND value='node';
-
-SELECT 'Workloads:', COUNT(DISTINCT entity_key) 
-FROM string_attributes WHERE key='type' AND value='workload';
-
--- Check distributions
-SELECT value, COUNT(*) FROM string_attributes 
-WHERE key='status' GROUP BY value;
-
--- Check workload→node relationships
-SELECT s1.value as workload_id, s2.value as assigned_node
-FROM string_attributes s1
 JOIN string_attributes s2 ON s1.entity_key = s2.entity_key
 WHERE s1.key = 'workload_id' AND s2.key = 'assigned_node' AND s2.value != ''
 LIMIT 10;
 ```
 
-#### Script 2: `generate_dc_load.py` — Ongoing Operations (TODO)
+### Scripts
 
-Generates realistic churn: status changes, new workloads, completions.
-
-```bash
-uv run python -m db.generate_dc_load \
-  --input data/dc_seed_2x.db \
-  --output data/dc_load_2x.db \
-  --blocks 10000 \
-  --events-per-block 100 \
-  --seed 42
-```
-
-**Per-block event mix:**
-
-| Event Type | % | Description |
-|------------|---|-------------|
-| Node status change | 10% | available↔busy↔offline + NodeEvent |
-| New workload | 30% | Create pending workload |
-| Workload assigned | 20% | pending→running + set assigned_node |
-| Workload completed | 30% | running→completed + WorkloadEvent |
-| Workload failed | 10% | running→failed + WorkloadEvent |
+See [scripts.md](scripts.md) for detailed documentation on:
+- `generate_dc_seed.py` — Seed database generator
+- `inspect_dc_db.py` — Database inspector
+- Manual database inspection with SQLite CLI
 
 ### Benchmark Combinations
 
@@ -1790,3 +1645,4 @@ Phase 5: Record latencies for both reads and writes
 3. **Implement DC read benchmark** — Verifiable queries against known data
 4. **Run baseline tests** — DC-only at 2x scale to validate approach
 5. **Integrate with existing benchmarks** — Mix DC + mendoza for combined tests
+

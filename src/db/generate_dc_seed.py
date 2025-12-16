@@ -44,11 +44,17 @@ from typing import Iterator
 # Configuration & Constants
 # =============================================================================
 
+NODE = "node"
+WORKLOAD = "workload"
+
 MAX_BLOCK = 9223372036854775807  # Max int64, represents "current" state
 
 # System attributes added by arkiv
 SYSTEM_STRING_ATTRS = ["$creator", "$key", "$owner"]
 SYSTEM_NUMERIC_ATTRS = ["$createdAtBlock", "$expiration", "$opIndex", "$sequence", "$txIndex"]
+
+DEFAULT_NODE_UPDATES_PER_BLOCK = 60
+DEFAULT_WORKLOAD_UPDATES_PER_BLOCK = 600
 
 
 @dataclass
@@ -66,6 +72,10 @@ class NodeEntity:
     avail_hours: int
     payload: bytes
     block: int
+    ttl: int
+    tx_index: int = 0
+    op_index: int = 0
+    sequence: int = 0
 
 
 @dataclass
@@ -83,6 +93,10 @@ class WorkloadEntity:
     max_hours: int
     payload: bytes
     block: int
+    ttl: int
+    tx_index: int = 0
+    op_index: int = 0
+    sequence: int = 0
 
 
 # =============================================================================
@@ -192,6 +206,39 @@ def get_max_hours_distribution() -> list[tuple[int, float]]:
     ]
 
 
+def get_ttl_blocks_distribution() -> list[tuple[tuple[int, int], float]]:
+    """
+    TTL in number of blocks distribution: ((min, max), cumulative_probability).
+    
+    Block time = 2s, so:
+    - 1 hour = 1,800 blocks
+    - 1 day = 43,200 blocks
+    - 1 week = 302,400 blocks
+    
+    Distribution:
+    - 10%: 1-6 hours (short-lived)
+    - 60%: 12 hours - 7 days (medium-lived)
+    - 30%: 7-28 days (long-lived)
+    """
+    return [
+        ((1800, 10800), 0.10),       # 1-6 hours
+        ((21600, 302400), 0.70),     # 12 hours - 7 days
+        ((302400, 1209600), 1.00),   # 7-28 days
+    ]
+
+
+def sample_ttl_blocks(rng: random.Random) -> int:
+    """Sample TTL in blocks from the TTL distribution."""
+    dist = get_ttl_blocks_distribution()
+    r = rng.random()
+    for (min_val, max_val), cumulative_prob in dist:
+        if r <= cumulative_prob:
+            return rng.randint(min_val, max_val)
+    # Fallback to last range
+    min_val, max_val = dist[-1][0]
+    return rng.randint(min_val, max_val)
+
+
 def sample_from_distribution(rng: random.Random, dist: list[tuple[any, float]]) -> any:
     """Sample a value from a cumulative probability distribution."""
     r = rng.random()
@@ -259,7 +306,8 @@ def create_node(
     price_min, price_max = get_price_hour_range()
     price_hour = rng.randint(price_min, price_max)
     avail_hours = sample_from_distribution(rng, get_avail_hours_distribution())
-    
+    ttl_blocks = sample_ttl_blocks(rng)
+
     # Generate random payload
     payload = bytes(rng.getrandbits(8) for _ in range(payload_size))
     
@@ -276,6 +324,7 @@ def create_node(
         avail_hours=avail_hours,
         payload=payload,
         block=block,
+        ttl=ttl_blocks
     )
 
 
@@ -301,7 +350,8 @@ def create_workload(
     req_cpu = sample_from_distribution(rng, get_req_cpu_distribution())
     req_ram = sample_from_distribution(rng, get_req_ram_distribution())
     max_hours = sample_from_distribution(rng, get_max_hours_distribution())
-    
+    ttl_blocks = sample_ttl_blocks(rng)
+
     # Assign to node (only if running, pending workloads are unassigned)
     if status == "running":
         node_num = workload_to_node_num(workload_num, nodes_per_dc)
@@ -325,6 +375,7 @@ def create_workload(
         max_hours=max_hours,
         payload=payload,
         block=block,
+        ttl=ttl_blocks
     )
 
 
@@ -335,32 +386,49 @@ def create_workload(
 def generate_nodes(
     num_datacenters: int,
     nodes_per_dc: int,
+    nodes_per_block: int,
     payload_size: int,
     start_block: int,
     seed: int,
 ) -> Iterator[NodeEntity]:
     """Generate all Node entities across all data centers."""
+    node_counter = 0
+    current_block = start_block
+
     for dc_num in range(1, num_datacenters + 1):
         for node_num in range(1, nodes_per_dc + 1):
-            yield create_node(dc_num, node_num, payload_size, start_block, seed)
+            yield create_node(dc_num, node_num, payload_size, current_block, seed)
+
+            node_counter += 1
+            if node_counter >= nodes_per_block:
+                current_block += 1
+                node_counter = 0
 
 
 def generate_workloads(
     num_datacenters: int,
     nodes_per_dc: int,
     workloads_per_node: float,
+    workloads_per_block: int,
     payload_size: int,
     start_block: int,
     seed: int,
 ) -> Iterator[WorkloadEntity]:
     """Generate all Workload entities across all data centers."""
     workloads_per_dc = int(nodes_per_dc * workloads_per_node)
+    workload_counter = 0
+    current_block = start_block
     
     for dc_num in range(1, num_datacenters + 1):
         for workload_num in range(1, workloads_per_dc + 1):
             yield create_workload(
-                dc_num, workload_num, nodes_per_dc, payload_size, start_block, seed
+                dc_num, workload_num, nodes_per_dc, payload_size, current_block, seed
             )
+
+            workload_counter += 1
+            if workload_counter >= workloads_per_block:
+                current_block += 1
+                workload_counter = 0    
 
 
 # =============================================================================
@@ -383,11 +451,11 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
     # String attributes
     string_attrs = [
         ("dc_id", node.dc_id),
+        ("type", NODE),
         ("node_id", node.node_id),
         ("region", node.region),
         ("status", node.status),
         ("vm_type", node.vm_type),
-        ("type", "node"),  # Entity type marker
         # System attributes
         ("$creator", creator_address),
         ("$key", "0x" + entity_key.hex()),
@@ -411,17 +479,19 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
         # System attributes
         ("$createdAtBlock", block),
         ("$expiration", MAX_BLOCK),
-        ("$opIndex", 0),
-        ("$sequence", 0),
-        ("$txIndex", 0),
+        ("$opIndex", node.op_index),
+        ("$sequence", node.sequence),
+        ("$txIndex", node.tx_index),
     ]
     
+    expries_at_block = block + node.ttl
+
     for key, value in numeric_attrs:
         inserts.append((
             """INSERT INTO numeric_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, MAX_BLOCK, key, value)
+            (entity_key, block, expries_at_block, key, value)
         ))
     
     # Payload with cached attributes as JSON
@@ -432,7 +502,7 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
         """INSERT INTO payloads 
            (entity_key, from_block, to_block, payload, content_type, string_attributes, numeric_attributes) 
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (entity_key, block, MAX_BLOCK, node.payload, "application/octet-stream", 
+        (entity_key, block, expries_at_block, node.payload, "application/octet-stream", 
          string_attrs_json, numeric_attrs_json)
     ))
     
@@ -455,12 +525,12 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
     # String attributes
     string_attrs = [
         ("dc_id", workload.dc_id),
+        ("type", WORKLOAD),
         ("workload_id", workload.workload_id),
         ("status", workload.status),
         ("assigned_node", workload.assigned_node),
         ("region", workload.region),
         ("vm_type", workload.vm_type),
-        ("type", "workload"),  # Entity type marker
         # System attributes
         ("$creator", creator_address),
         ("$key", "0x" + entity_key.hex()),
@@ -476,16 +546,18 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
         ))
     
     # Numeric attributes
+    expries_at_block = block + workload.ttl
+
     numeric_attrs = [
         ("req_cpu", workload.req_cpu),
         ("req_ram", workload.req_ram),
         ("max_hours", workload.max_hours),
         # System attributes
         ("$createdAtBlock", block),
-        ("$expiration", MAX_BLOCK),
-        ("$opIndex", 0),
-        ("$sequence", 0),
-        ("$txIndex", 0),
+        ("$expiration", expries_at_block),
+        ("$opIndex", workload.op_index),
+        ("$sequence", workload.sequence),
+        ("$txIndex", workload.tx_index),
     ]
     
     for key, value in numeric_attrs:
@@ -493,7 +565,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
             """INSERT INTO numeric_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, MAX_BLOCK, key, value)
+            (entity_key, block, expries_at_block, key, value)
         ))
     
     # Payload with cached attributes as JSON
@@ -504,7 +576,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
         """INSERT INTO payloads 
            (entity_key, from_block, to_block, payload, content_type, string_attributes, numeric_attributes) 
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (entity_key, block, MAX_BLOCK, workload.payload, "application/octet-stream",
+        (entity_key, block, expries_at_block, workload.payload, "application/octet-stream",
          string_attrs_json, numeric_attrs_json)
     ))
     
@@ -622,6 +694,7 @@ def generate_all_nodes(
     nodes_per_dc: int,
     payload_size: int,
     start_block: int,
+    nodes_per_block: int,
     seed: int,
     creator_address: str = "0x0000000000000000000000000000000000dc0001",
     batch_size: int = 1000,
@@ -639,7 +712,7 @@ def generate_all_nodes(
     count = 0
     start_time = time.time()
     
-    for node in generate_nodes(num_datacenters, nodes_per_dc, payload_size, start_block, seed):
+    for node in generate_nodes(num_datacenters, nodes_per_dc, nodes_per_block, payload_size, start_block, seed):
         inserts = node_to_sql_inserts(node, creator_address)
         for sql, params in inserts:
             cursor.execute(sql, params)
@@ -663,6 +736,7 @@ def generate_all_workloads(
     num_datacenters: int,
     nodes_per_dc: int,
     workloads_per_node: float,
+    workloads_per_block: int,
     payload_size: int,
     start_block: int,
     seed: int,
@@ -684,7 +758,7 @@ def generate_all_workloads(
     start_time = time.time()
     
     for workload in generate_workloads(
-        num_datacenters, nodes_per_dc, workloads_per_node, payload_size, start_block, seed
+        num_datacenters, nodes_per_dc, workloads_per_node, workloads_per_block, payload_size, start_block, seed
     ):
         inserts = workload_to_sql_inserts(workload, creator_address)
         for sql, params in inserts:
@@ -760,6 +834,18 @@ def main():
         default=1000,
         help="Commit batch size (default: 1000)"
     )
+    parser.add_argument(
+        "--nodes-per-block",
+        type=int,
+        default=DEFAULT_NODE_UPDATES_PER_BLOCK,
+        help="Number of node entities created per block"
+    )
+    parser.add_argument(
+        "--workloads-per-block",
+        type=int,
+        default=DEFAULT_WORKLOAD_UPDATES_PER_BLOCK,
+        help="Number of workload entities created per block"
+    )
     
     args = parser.parse_args()
     
@@ -809,6 +895,7 @@ def main():
         conn=conn,
         num_datacenters=args.datacenters,
         nodes_per_dc=args.nodes_per_dc,
+        nodes_per_block=args.nodes_per_block,
         payload_size=args.payload_size,
         start_block=start_block,
         seed=args.seed,
@@ -822,6 +909,7 @@ def main():
         num_datacenters=args.datacenters,
         nodes_per_dc=args.nodes_per_dc,
         workloads_per_node=args.workloads_per_node,
+        workloads_per_block=args.workloads_per_block,
         payload_size=args.payload_size,
         start_block=start_block,
         seed=args.seed,

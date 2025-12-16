@@ -25,6 +25,22 @@ def format_size(size_bytes: int) -> str:
         return f"{size_bytes} bytes"
 
 
+def format_ttl_blocks(ttl_blocks: int) -> str:
+    """Format TTL in blocks as human-readable string (assuming 2s block time)."""
+    if ttl_blocks is None:
+        return "N/A"
+    seconds = ttl_blocks * 2
+    if seconds >= 86400:
+        days = seconds / 86400
+        return f"{ttl_blocks:,} blocks (~{days:.1f} days)"
+    elif seconds >= 3600:
+        hours = seconds / 3600
+        return f"{ttl_blocks:,} blocks (~{hours:.1f} hours)"
+    else:
+        minutes = seconds / 60
+        return f"{ttl_blocks:,} blocks (~{minutes:.1f} min)"
+
+
 def get_random_entity(conn: sqlite3.Connection, entity_type: str) -> dict | None:
     """
     Fetch a random entity of the given type with all its attributes.
@@ -193,6 +209,30 @@ def inspect_database(db_path: str) -> dict:
     # Total rows
     stats["total_rows"] = stats["total_str_attrs"] + stats["total_num_attrs"] + stats["total_payloads"]
     
+    # TTL statistics for nodes (to_block - from_block)
+    cursor.execute("""
+        SELECT MIN(p.to_block - p.from_block), MAX(p.to_block - p.from_block)
+        FROM payloads p
+        JOIN string_attributes sa ON p.entity_key = sa.entity_key
+        WHERE sa.key = 'type' AND sa.value = 'node'
+        AND p.to_block < 9223372036854775807
+    """)
+    row = cursor.fetchone()
+    stats["node_ttl_min"] = row[0] if row and row[0] is not None else None
+    stats["node_ttl_max"] = row[1] if row and row[1] is not None else None
+    
+    # TTL statistics for workloads
+    cursor.execute("""
+        SELECT MIN(p.to_block - p.from_block), MAX(p.to_block - p.from_block)
+        FROM payloads p
+        JOIN string_attributes sa ON p.entity_key = sa.entity_key
+        WHERE sa.key = 'type' AND sa.value = 'workload'
+        AND p.to_block < 9223372036854775807
+    """)
+    row = cursor.fetchone()
+    stats["workload_ttl_min"] = row[0] if row and row[0] is not None else None
+    stats["workload_ttl_max"] = row[1] if row and row[1] is not None else None
+    
     # Get random example entities
     stats["example_node"] = get_random_entity(conn, "node")
     stats["example_workload"] = get_random_entity(conn, "workload")
@@ -247,6 +287,19 @@ def print_report(db_path: str, stats: dict):
     print(f"Avg string attrs/entity:   {stats['avg_str_attrs_per_entity']:.1f}")
     print(f"Avg numeric attrs/entity:  {stats['avg_num_attrs_per_entity']:.1f}")
     print(f"Avg payload size:          {format_size(int(stats['avg_payload_size']))}")
+    print()
+    
+    print("--- TTL Statistics (block time = 2s) ---")
+    if stats.get("node_ttl_min") is not None:
+        print(f"Node TTL min:              {format_ttl_blocks(stats['node_ttl_min'])}")
+        print(f"Node TTL max:              {format_ttl_blocks(stats['node_ttl_max'])}")
+    else:
+        print("Node TTL:                  No nodes with finite TTL")
+    if stats.get("workload_ttl_min") is not None:
+        print(f"Workload TTL min:          {format_ttl_blocks(stats['workload_ttl_min'])}")
+        print(f"Workload TTL max:          {format_ttl_blocks(stats['workload_ttl_max'])}")
+    else:
+        print("Workload TTL:              No workloads with finite TTL")
     print()
     
     print("--- Row Counts ---")
