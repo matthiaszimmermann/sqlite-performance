@@ -13,6 +13,33 @@ import sqlite3
 import sys
 
 
+# =============================================================================
+# Configuration
+# =============================================================================
+
+# Memory allocation for SQLite in GB (adjust based on available RAM)
+MEMORY_GB = 16
+
+
+def configure_connection(conn: sqlite3.Connection) -> None:
+    """Configure SQLite connection for optimal read performance."""
+    # For read-only workloads: small cache, large mmap
+    # mmap lets the OS kernel manage caching efficiently for scans
+    cache_mb = 256  # Small cache for index lookups
+    mmap_gb = MEMORY_GB - 1  # Most memory to mmap
+    
+    # cache_size in KB (negative = KB)
+    cache_kb = cache_mb * 1024
+    conn.execute(f"PRAGMA cache_size = -{cache_kb}")
+    
+    # mmap_size in bytes
+    mmap_bytes = mmap_gb * 1024 * 1024 * 1024
+    conn.execute(f"PRAGMA mmap_size = {mmap_bytes}")
+    
+    # Read-only optimizations
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+
 def format_size(size_bytes: int) -> str:
     """Format byte size as human-readable string."""
     if size_bytes >= 1024**3:
@@ -47,6 +74,8 @@ def get_random_entity(conn: sqlite3.Connection, entity_type: str) -> dict | None
     
     Returns dict with:
         - entity_key: hex string
+        - from_block: int
+        - to_block: int
         - string_attrs: dict of key->value
         - numeric_attrs: dict of key->value
         - payload_size: int
@@ -68,15 +97,29 @@ def get_random_entity(conn: sqlite3.Connection, entity_type: str) -> dict | None
     
     result = {
         "entity_key": entity_key.hex() if isinstance(entity_key, bytes) else entity_key,
+        "from_block": None,
+        "to_block": None,
         "string_attrs": {},
         "numeric_attrs": {},
         "payload_size": 0,
     }
     
+    # Get from_block and to_block from payloads table
+    cursor.execute("""
+        SELECT from_block, to_block, LENGTH(payload) FROM payloads 
+        WHERE entity_key = ?
+        LIMIT 1
+    """, (entity_key,))
+    row = cursor.fetchone()
+    if row:
+        result["from_block"] = row[0]
+        result["to_block"] = row[1]
+        result["payload_size"] = row[2] if row[2] else 0
+    
     # Get string attributes (excluding system attrs for cleaner output)
     cursor.execute("""
         SELECT key, value FROM string_attributes 
-        WHERE entity_key = ? AND to_block = 9223372036854775807
+        WHERE entity_key = ?
         AND key NOT LIKE '$%'
         AND key != 'type'
         ORDER BY key
@@ -87,21 +130,12 @@ def get_random_entity(conn: sqlite3.Connection, entity_type: str) -> dict | None
     # Get numeric attributes (excluding system attrs)
     cursor.execute("""
         SELECT key, value FROM numeric_attributes 
-        WHERE entity_key = ? AND to_block = 9223372036854775807
+        WHERE entity_key = ?
         AND key NOT LIKE '$%'
         ORDER BY key
     """, (entity_key,))
     for key, value in cursor.fetchall():
         result["numeric_attrs"][key] = value
-    
-    # Get payload size
-    cursor.execute("""
-        SELECT LENGTH(payload) FROM payloads 
-        WHERE entity_key = ? AND to_block = 9223372036854775807
-    """, (entity_key,))
-    row = cursor.fetchone()
-    if row and row[0]:
-        result["payload_size"] = row[0]
     
     return result
 
@@ -130,6 +164,7 @@ def inspect_database(db_path: str) -> dict:
     stats["file_size"] = os.path.getsize(db_path)
     
     conn = sqlite3.connect(db_path)
+    configure_connection(conn)
     cursor = conn.cursor()
     
     # Get data centers (distinct dc_id values)
@@ -245,6 +280,14 @@ def format_entity_example(entity: dict, entity_type: str) -> str:
     """Format an entity example for display."""
     lines = []
     lines.append(f"  Entity Key: {entity['entity_key']}")
+    
+    # Block range info
+    from_block = entity.get('from_block')
+    to_block = entity.get('to_block')
+    if from_block is not None and to_block is not None:
+        ttl = to_block - from_block
+        lines.append(f"  From Block: {from_block:,}")
+        lines.append(f"  To Block:   {to_block:,} (TTL: {format_ttl_blocks(ttl)})")
     
     lines.append("  String Attributes:")
     for key, value in sorted(entity["string_attrs"].items()):

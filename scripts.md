@@ -102,6 +102,23 @@ Use SQLite CLI to manually inspect entity data.
 sqlite3 data/dc_test.db
 ```
 
+Show colum names as 1st row
+```sql
+.headers on
+```
+
+Other useful modes:
+```sql
+-- bordered table
+.mode table 
+
+-- Unicode box drawing
+.mode box
+
+-- one value per line (good for wide rows)
+.mode line
+```
+
 ### Find Entity Keys
 
 ```sql
@@ -124,8 +141,6 @@ Replace `<HEX_KEY>` with the entity key (e.g., `3938da435c3a374f356c3178e6cede3e
 #### Payload (all attributes except payload content)
 
 ```sql
-.headers on
-
 SELECT 
   hex(entity_key) as entity_key,
   from_block,

@@ -37,6 +37,7 @@ import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterator
 
 
@@ -447,6 +448,7 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
     inserts = []
     entity_key = node.entity_key
     block = node.block
+    expires_at_block = block + node.ttl
     
     # String attributes
     string_attrs = [
@@ -467,7 +469,7 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
             """INSERT INTO string_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, MAX_BLOCK, key, value)
+            (entity_key, block, expires_at_block, key, value)
         ))
     
     # Numeric attributes
@@ -478,20 +480,18 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
         ("avail_hours", node.avail_hours),
         # System attributes
         ("$createdAtBlock", block),
-        ("$expiration", MAX_BLOCK),
+        ("$expiration", expires_at_block),
         ("$opIndex", node.op_index),
         ("$sequence", node.sequence),
         ("$txIndex", node.tx_index),
     ]
-    
-    expries_at_block = block + node.ttl
 
     for key, value in numeric_attrs:
         inserts.append((
             """INSERT INTO numeric_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, expries_at_block, key, value)
+            (entity_key, block, expires_at_block, key, value)
         ))
     
     # Payload with cached attributes as JSON
@@ -502,7 +502,7 @@ def node_to_sql_inserts(node: NodeEntity, creator_address: str) -> list[tuple[st
         """INSERT INTO payloads 
            (entity_key, from_block, to_block, payload, content_type, string_attributes, numeric_attributes) 
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (entity_key, block, expries_at_block, node.payload, "application/octet-stream", 
+        (entity_key, block, expires_at_block, node.payload, "application/octet-stream", 
          string_attrs_json, numeric_attrs_json)
     ))
     
@@ -521,6 +521,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
     inserts = []
     entity_key = workload.entity_key
     block = workload.block
+    expires_at_block = block + workload.ttl
     
     # String attributes
     string_attrs = [
@@ -542,19 +543,17 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
             """INSERT INTO string_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, MAX_BLOCK, key, value)
+            (entity_key, block, expires_at_block, key, value)
         ))
     
     # Numeric attributes
-    expries_at_block = block + workload.ttl
-
     numeric_attrs = [
         ("req_cpu", workload.req_cpu),
         ("req_ram", workload.req_ram),
         ("max_hours", workload.max_hours),
         # System attributes
         ("$createdAtBlock", block),
-        ("$expiration", expries_at_block),
+        ("$expiration", expires_at_block),
         ("$opIndex", workload.op_index),
         ("$sequence", workload.sequence),
         ("$txIndex", workload.tx_index),
@@ -565,7 +564,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
             """INSERT INTO numeric_attributes 
                (entity_key, from_block, to_block, key, value) 
                VALUES (?, ?, ?, ?, ?)""",
-            (entity_key, block, expries_at_block, key, value)
+            (entity_key, block, expires_at_block, key, value)
         ))
     
     # Payload with cached attributes as JSON
@@ -576,7 +575,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
         """INSERT INTO payloads 
            (entity_key, from_block, to_block, payload, content_type, string_attributes, numeric_attributes) 
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (entity_key, block, expries_at_block, workload.payload, "application/octet-stream",
+        (entity_key, block, expires_at_block, workload.payload, "application/octet-stream",
          string_attrs_json, numeric_attrs_json)
     ))
     
@@ -587,7 +586,7 @@ def workload_to_sql_inserts(workload: WorkloadEntity, creator_address: str) -> l
 # Database Setup
 # =============================================================================
 
-SCHEMA_SQL = """
+SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS string_attributes (
     entity_key BLOB NOT NULL,
     from_block INTEGER NOT NULL,
@@ -622,7 +621,9 @@ CREATE TABLE IF NOT EXISTS last_block (
     block INTEGER NOT NULL,
     PRIMARY KEY (id)
 );
+"""
 
+INDEX_SQL = """
 -- Indexes for string_attributes
 CREATE INDEX IF NOT EXISTS idx_str_entity_key_value ON string_attributes (from_block, to_block, key, value);
 CREATE INDEX IF NOT EXISTS idx_str_kv_temporal ON string_attributes (key, value, from_block DESC, to_block DESC);
@@ -639,6 +640,35 @@ CREATE INDEX IF NOT EXISTS idx_num_delete ON numeric_attributes (to_block);
 -- Indexes for payloads
 CREATE INDEX IF NOT EXISTS idx_payloads_delete ON payloads (to_block);
 """
+
+# For backward compatibility
+SCHEMA_SQL = SCHEMA_TABLES_SQL + INDEX_SQL
+
+
+def drop_indexes(conn: sqlite3.Connection):
+    """Drop all indexes to speed up bulk inserts."""
+    print(f"Dropping indexes... - {datetime.now().strftime('%H:%M:%S')}")
+    conn.execute("DROP INDEX IF EXISTS idx_str_entity_key_value")
+    conn.execute("DROP INDEX IF EXISTS idx_str_kv_temporal")
+    conn.execute("DROP INDEX IF EXISTS idx_str_entity_key")
+    conn.execute("DROP INDEX IF EXISTS idx_str_delete")
+    conn.execute("DROP INDEX IF EXISTS idx_str_entity_kv")
+    conn.execute("DROP INDEX IF EXISTS idx_num_entity_key_value")
+    conn.execute("DROP INDEX IF EXISTS idx_num_kv_temporal")
+    conn.execute("DROP INDEX IF EXISTS idx_num_entity_key")
+    conn.execute("DROP INDEX IF EXISTS idx_num_delete")
+    conn.execute("DROP INDEX IF EXISTS idx_payloads_delete")
+    conn.commit()
+    print(f"Indexes dropped - {datetime.now().strftime('%H:%M:%S')}")
+
+
+def create_indexes(conn: sqlite3.Connection):
+    """Create all indexes after bulk inserts."""
+    print(f"Creating indexes... - {datetime.now().strftime('%H:%M:%S')}")
+    start = time.time()
+    conn.executescript(INDEX_SQL)
+    elapsed = time.time() - start
+    print(f"Indexes created in {elapsed:.1f}s - {datetime.now().strftime('%H:%M:%S')}")
 
 
 def init_database(db_path: str, input_db: str | None = None) -> sqlite3.Connection:
@@ -662,17 +692,38 @@ def init_database(db_path: str, input_db: str | None = None) -> sqlite3.Connecti
         shutil.copy2(input_db, db_path)
         conn = sqlite3.connect(db_path)
     else:
-        # Create fresh database with schema
+        # Create fresh database with schema (tables only, indexes later)
         conn = sqlite3.connect(db_path)
-        conn.executescript(SCHEMA_SQL)
+        conn.executescript(SCHEMA_TABLES_SQL)
     
     # Set pragmas for performance
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA cache_size = -2000000")  # 2GB cache
     conn.execute("PRAGMA temp_store = MEMORY")
     
     return conn
+
+
+def configure_memory(conn: sqlite3.Connection, memory_gb: int) -> None:
+    """Configure SQLite memory settings for optimal bulk loading.
+    
+    Args:
+        conn: SQLite connection
+        memory_gb: Total memory to allocate in GB
+    """
+    # Allocate ~60% to cache, ~40% to mmap
+    cache_gb = max(1, int(memory_gb * 0.6))
+    mmap_gb = max(1, int(memory_gb * 0.4))
+    
+    # cache_size in KB (negative = KB, positive = pages)
+    cache_kb = cache_gb * 1024 * 1024
+    conn.execute(f"PRAGMA cache_size = -{cache_kb}")
+    
+    # mmap_size in bytes
+    mmap_bytes = mmap_gb * 1024 * 1024 * 1024
+    conn.execute(f"PRAGMA mmap_size = {mmap_bytes}")
+    
+    print(f"Memory config: {cache_gb}GB cache, {mmap_gb}GB mmap")
 
 
 def get_max_block(conn: sqlite3.Connection) -> int:
@@ -697,7 +748,7 @@ def generate_all_nodes(
     nodes_per_block: int,
     seed: int,
     creator_address: str = "0x0000000000000000000000000000000000dc0001",
-    batch_size: int = 1000,
+    batch_size: int = 1000000,
 ) -> int:
     """
     Generate and insert all Node entities.
@@ -722,11 +773,11 @@ def generate_all_nodes(
             conn.commit()
             elapsed = time.time() - start_time
             rate = count / elapsed
-            print(f"  Nodes: {count:,}/{total_nodes:,} ({100*count/total_nodes:.1f}%) - {rate:.0f} entities/sec")
+            print(f"  Nodes: {count:,}/{total_nodes:,} ({100*count/total_nodes:.1f}%) - {rate:.0f} entities/sec - {datetime.now().strftime('%H:%M:%S')}")
     
     conn.commit()
     elapsed = time.time() - start_time
-    print(f"  Completed {count:,} nodes in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec)")
+    print(f"  Completed {count:,} nodes in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec) - {datetime.now().strftime('%H:%M:%S')}")
     
     return count
 
@@ -769,11 +820,11 @@ def generate_all_workloads(
             conn.commit()
             elapsed = time.time() - start_time
             rate = count / elapsed
-            print(f"  Workloads: {count:,}/{total_workloads:,} ({100*count/total_workloads:.1f}%) - {rate:.0f} entities/sec")
+            print(f"  Workloads: {count:,}/{total_workloads:,} ({100*count/total_workloads:.1f}%) - {rate:.0f} entities/sec - {datetime.now().strftime('%H:%M:%S')}")
     
     conn.commit()
     elapsed = time.time() - start_time
-    print(f"  Completed {count:,} workloads in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec)")
+    print(f"  Completed {count:,} workloads in {elapsed:.1f}s ({count/elapsed:.0f} entities/sec) - {datetime.now().strftime('%H:%M:%S')}")
     
     return count
 
@@ -846,6 +897,17 @@ def main():
         default=DEFAULT_WORKLOAD_UPDATES_PER_BLOCK,
         help="Number of workload entities created per block"
     )
+    parser.add_argument(
+        "--no-indexes",
+        action="store_true",
+        help="Drop indexes before insert and recreate after (faster for bulk loads)"
+    )
+    parser.add_argument(
+        "--memory", "-m",
+        type=int,
+        default=2,
+        help="Memory to use for SQLite cache+mmap in GB (default: 2)"
+    )
     
     args = parser.parse_args()
     
@@ -882,6 +944,14 @@ def main():
     
     # Initialize database
     conn = init_database(args.output, args.input)
+    
+    # Configure memory settings
+    configure_memory(conn, args.memory)
+    
+    # Drop indexes if --no-indexes flag is set (for faster bulk inserts)
+    if args.no_indexes:
+        drop_indexes(conn)
+        print()
     
     # Get starting block (after existing data if any)
     start_block = get_max_block(conn) + 1
@@ -922,6 +992,11 @@ def main():
         (start_block,)
     )
     conn.commit()
+    
+    # Recreate indexes if --no-indexes flag was set
+    if args.no_indexes:
+        print()
+        create_indexes(conn)
     
     total_time = time.time() - start_time
     
