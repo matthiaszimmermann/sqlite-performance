@@ -33,6 +33,7 @@ export function initDatabase(
     return writeDb
   }
 
+  
   if (poolSizeOverride !== undefined) {
     poolSize = poolSizeOverride
   }
@@ -348,79 +349,394 @@ export function getEntityByKey(key: string): Entity | null {
   }
 }
 
-export function queryEntities(
+/**
+ * Build Arkiv query language string from filter parameters.
+ * Reference: https://github.com/Arkiv-Network/arkiv-sdk-python?tab=readme-ov-file#query-language
+ * 
+ * Supports range queries for numeric annotations:
+ * - number: exact match (e.g., 8 -> "cpu_count = 8")
+ * - string with operator: range query (e.g., ">=8" -> "cpu_count >= 8")
+ *   Supported operators: >=, <=, >, <, !=
+ */
+function buildArkivQuery(
   ownerAddress?: string,
   stringAnnotations?: Record<string, string>,
-  numericAnnotations?: Record<string, number>,
+  numericAnnotations?: Record<string, number | string>,
+): string {
+  const conditions: string[] = []
+
+  // Filter by owner_address if provided
+  if (ownerAddress) {
+    conditions.push(`ownerAddress = "${ownerAddress}"`)
+  }
+
+  // Filter by string annotations (equality)
+  if (stringAnnotations && Object.keys(stringAnnotations).length > 0) {
+    for (const [key, value] of Object.entries(stringAnnotations)) {
+      // Escape double quotes in string values
+      const escapedValue = value.replace(/"/g, '\\"')
+      conditions.push(`${key} = "${escapedValue}"`)
+    }
+  }
+
+  // Filter by numeric annotations (equality or range)
+  // Supports: number (exact match) or string with operator (>=, <=, >, <, !=)
+  if (numericAnnotations && Object.keys(numericAnnotations).length > 0) {
+    for (const [key, value] of Object.entries(numericAnnotations)) {
+      if (typeof value === "number") {
+        // Exact match
+        conditions.push(`${key} = ${value}`)
+      } else if (typeof value === "string") {
+        // Range query with operator
+        // Parse format: ">=8", "<=32", ">16", "<64", "!=0"
+        const rangeMatch = value.match(/^(>=|<=|>|<|!=)\s*(\d+(?:\.\d+)?)$/)
+        if (rangeMatch) {
+          const operator = rangeMatch[1]
+          const numValue = rangeMatch[2]
+          conditions.push(`${key} ${operator} ${numValue}`)
+        } else {
+          // Fallback: try to parse as number for backward compatibility
+          const numValue = parseFloat(value)
+          if (!Number.isNaN(numValue)) {
+            conditions.push(`${key} = ${numValue}`)
+          }
+        }
+      }
+    }
+  }
+
+  // Join all conditions with AND
+  return conditions.join(" AND ")
+}
+
+// Query cache: stores SQL query and parameters for reuse
+interface CachedQuery {
+  sqlQuery: string
+  params: (string | number)[]
+}
+
+const queryCache = new Map<string, CachedQuery>()
+let queryCacheEnabled = false // Cache is disabled by default
+
+/**
+ * Generate normalized cache key from Arkiv query structure (ignoring values).
+ * Only includes attribute keys, operators, limit, and offset - not the actual values.
+ */
+function getCacheKey(arkivQuery: string, limit: number, offset: number): string {
+  if (!arkivQuery || arkivQuery.trim() === "") {
+    return `empty|limit:${limit}|offset:${offset}`
+  }
+
+  // Parse query to extract structure (keys and operators) without values
+  const conditions = parseArkivQuery(arkivQuery)
+  
+  // Build normalized key: only include attribute keys and operators
+  const normalizedParts: string[] = []
+  
+  for (const cond of conditions) {
+    const type = cond.isNumeric ? "num" : "str"
+    normalizedParts.push(`${type}:${cond.key}:${cond.operator}`)
+  }
+  
+  // Sort to ensure consistent cache keys regardless of order
+  normalizedParts.sort()
+  
+  return `${normalizedParts.join(",")}|limit:${limit}|offset:${offset}`
+}
+
+/**
+ * Parse Arkiv query string into structured conditions
+ */
+interface ParsedCondition {
+  key: string
+  operator: string
+  value: string | number
+  isNumeric: boolean
+}
+
+function parseArkivQuery(arkivQuery: string): ParsedCondition[] {
+  if (!arkivQuery || arkivQuery.trim() === "") {
+    return []
+  }
+
+  const conditions: ParsedCondition[] = []
+  // Split by AND (simple parsing - doesn't handle parentheses yet)
+  const andConditions = arkivQuery.split(" AND ").map((c) => c.trim())
+
+  for (const condition of andConditions) {
+    // Parse equality: key = "value" or key = number
+    const equalityMatch = condition.match(/^(\w+)\s*=\s*(.+)$/)
+    if (equalityMatch) {
+      const key = equalityMatch[1]
+      let value = equalityMatch[2].trim()
+
+      // Remove quotes from string values
+      if (value.startsWith('"') && value.endsWith('"')) {
+        value = value.slice(1, -1).replace(/\\"/g, '"')
+        conditions.push({
+          key,
+          operator: "=",
+          value,
+          isNumeric: false,
+        })
+      } else {
+        // Numeric annotation (equality)
+        const numValue = parseFloat(value)
+        if (!Number.isNaN(numValue)) {
+          conditions.push({
+            key,
+            operator: "=",
+            value: numValue,
+            isNumeric: true,
+          })
+        }
+      }
+    } else {
+      // Parse range operators: key >= number, key <= number, key > number, key < number, key != number
+      const rangeMatch = condition.match(/^(\w+)\s*(>=|<=|>|<|!=)\s*(\d+(?:\.\d+)?)$/)
+      if (rangeMatch) {
+        const key = rangeMatch[1]
+        const operator = rangeMatch[2]
+        const numValue = parseFloat(rangeMatch[3])
+
+        if (!Number.isNaN(numValue)) {
+          conditions.push({
+            key,
+            operator,
+            value: numValue,
+            isNumeric: true,
+          })
+        }
+      }
+    }
+  }
+
+  return conditions
+}
+
+/**
+ * Generate unique alias for attribute join
+ */
+function generateAttributeAlias(seed: number): string {
+  // Generate a unique alias similar to Go tool: arkiv_attr_<number>
+  return `arkiv_attr_${Math.abs(seed)}`
+}
+
+/**
+ * Convert Arkiv query string to SQL query.
+ * 
+ * Pattern:
+ * - Each string/numeric annotation gets an INNER JOIN
+ * - LEFT JOINs for owner and expiration attributes
+ * - WHERE clause filters by current block and attribute values
+ */
+function buildSqlFromArkivQuery(
+  arkivQuery: string,
+  currentBlock: number,
+  limit: number,
+  offset: number,
+): { sqlQuery: string; params: (string | number)[] } {
+  const conditions = parseArkivQuery(arkivQuery)
+  
+  // Separate string and numeric conditions
+  const stringConditions: ParsedCondition[] = []
+  const numericConditions: ParsedCondition[] = []
+  
+  for (const cond of conditions) {
+    if (cond.isNumeric) {
+      numericConditions.push(cond)
+    } else {
+      stringConditions.push(cond)
+    }
+  }
+
+  // Build SELECT clause
+  const selectClause = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes`
+
+  // Build FROM clause
+  const fromClause = `FROM payloads AS e`
+
+  // Build INNER JOINs for string attributes
+  const stringJoins: string[] = []
+  const stringJoinAliases: string[] = []
+  let aliasSeed = 0
+
+  for (let i = 0; i < stringConditions.length; i++) {
+    const alias = generateAttributeAlias(aliasSeed++)
+    stringJoinAliases.push(alias)
+    stringJoins.push(
+      `INNER JOIN string_attributes AS ${alias} ON e.entity_key = ${alias}.entity_key AND e.from_block = ${alias}.from_block AND ${alias}.key = ?`
+    )
+  }
+
+  // Build INNER JOINs for numeric attributes
+  const numericJoins: string[] = []
+  const numericJoinAliases: string[] = []
+
+  for (let i = 0; i < numericConditions.length; i++) {
+    const alias = generateAttributeAlias(aliasSeed++)
+    numericJoinAliases.push(alias)
+    numericJoins.push(
+      `INNER JOIN numeric_attributes AS ${alias} ON e.entity_key = ${alias}.entity_key AND e.from_block = ${alias}.from_block AND ${alias}.key = ?`
+    )
+  }
+
+  // Build LEFT JOINs for owner and expiration
+  const leftJoins = [
+    `LEFT JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner'`,
+    `LEFT JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration'`,
+  ]
+
+  // Build WHERE clause
+  const whereConditions: string[] = []
+  whereConditions.push(`? BETWEEN e.from_block AND e.to_block - 1`)
+
+  // Add attribute value filters
+  const valueFilters: string[] = []
+  
+  for (let i = 0; i < stringConditions.length; i++) {
+    const alias = stringJoinAliases[i]
+    valueFilters.push(`${alias}.value = ?`)
+  }
+
+  for (let i = 0; i < numericConditions.length; i++) {
+    const alias = numericJoinAliases[i]
+    const numericCond = numericConditions[i]
+    valueFilters.push(`${alias}.value ${numericCond.operator} ?`)
+  }
+
+  if (valueFilters.length > 0) {
+    whereConditions.push(`(${valueFilters.join(" AND ")})`)
+  }
+
+  // Build ORDER BY and LIMIT
+  const orderByClause = `ORDER BY from_block, entity_key`
+  const limitClause = `LIMIT ${limit}`
+  const offsetClause = offset > 0 ? `OFFSET ${offset}` : ""
+
+  // Combine all parts
+  const allJoins = [...stringJoins, ...numericJoins, ...leftJoins]
+  const sqlQuery = [
+    selectClause,
+    fromClause,
+    ...allJoins,
+    `WHERE ${whereConditions.join(" AND ")}`,
+    orderByClause,
+    limitClause,
+    offsetClause,
+  ]
+    .filter((part) => part !== "")
+    .join(" ")
+
+  // Build parameters array
+  // Order: attribute keys (string then numeric), current_block, attribute values (string then numeric)
+  const params: (string | number)[] = []
+  
+  // Attribute keys (string attributes first)
+  for (const cond of stringConditions) {
+    params.push(cond.key)
+  }
+  
+  // Attribute keys (numeric attributes)
+  for (const cond of numericConditions) {
+    params.push(cond.key)
+  }
+
+  // Current block parameter
+  params.push(currentBlock)
+  
+  // Attribute values (string attributes)
+  for (const cond of stringConditions) {
+    params.push(cond.value as string)
+  }
+  
+  // Attribute values (numeric attributes)
+  for (const cond of numericConditions) {
+    params.push(cond.value as number)
+  }
+
+  return { sqlQuery, params }
+}
+
+/**
+ * Execute Arkiv query against SQLite database.
+ * Converts Arkiv query string to SQL and executes it.
+ * 
+ * Optionally caches SQL query structure (with placeholders) to avoid repeated parsing.
+ * Parameters are built fresh each time from the actual query values.
+ */
+async function executeArkivQuery(
+  database: Database,
+  arkivQuery: string,
+  limit: number,
+  offset: number,
+): Promise<Array<Record<string, unknown>>> {
+  // Get current block number (needed for building params)
+  const currentBlock = getCurrentBlockNumber()
+
+  let sqlQuery: string
+  let params: (string | number)[]
+
+  // Check cache first if enabled - cache key ignores actual values
+  if (queryCacheEnabled) {
+    const cacheKey = getCacheKey(arkivQuery, limit, offset)
+    const cached = queryCache.get(cacheKey)
+    
+    if (cached) {
+      // Reuse cached SQL query structure (with placeholders)
+      console.log("cached.sqlQuery hit!!!", cached.sqlQuery)
+      sqlQuery = cached.sqlQuery
+      
+      // Build fresh parameters from the actual query values
+      // The SQL structure is the same, but values may differ
+      const { params: freshParams } = buildSqlFromArkivQuery(arkivQuery, currentBlock, limit, offset)
+      params = freshParams
+    } else {
+      // Build SQL query from Arkiv query (first time for this structure)
+      const result = buildSqlFromArkivQuery(arkivQuery, currentBlock, limit, offset)
+      sqlQuery = result.sqlQuery
+      params = result.params
+
+      // Cache only the SQL query structure (with placeholders)
+      // Don't cache parameters since they change with each query
+      queryCache.set(cacheKey, {
+        sqlQuery,
+        params: [], // Empty - params are built fresh each time
+      })
+    }
+  } else {
+    // Cache disabled - always build SQL query from scratch
+    const result = buildSqlFromArkivQuery(arkivQuery, currentBlock, limit, offset)
+    sqlQuery = result.sqlQuery
+    params = result.params
+  }
+
+  // Execute the SQL query with fresh parameters
+  console.log("sqlQuery", sqlQuery)
+  console.log("params", params)
+  const stmt = database.prepare(sqlQuery)
+  const rows = stmt.all(...params) as Array<Record<string, unknown>>
+
+  return rows
+}
+
+export async function queryEntities(
+  ownerAddress?: string,
+  stringAnnotations?: Record<string, string>,
+  numericAnnotations?: Record<string, number | string>,
   limit: number = 100,
   offset: number = 0,
   withAnnotations: boolean = false,
-): Entity[] {
+): Promise<Entity[]> {
   const startTime = performance.now()
   const database = getReadConnection()
 
-  // Build query using payloads table
-  // We need to get distinct entity_keys, taking the most recent version (highest from_block)
-  let query = `
-    SELECT p.*
-    FROM payloads p
-    INNER JOIN (
-      SELECT entity_key, MAX(from_block) as max_block
-      FROM payloads
-      GROUP BY entity_key
-    ) latest ON p.entity_key = latest.entity_key AND p.from_block = latest.max_block
-    WHERE 1=1
-  `
-  const params: any[] = []
+  // Build Arkiv query string
+  const arkivQuery = buildArkivQuery(ownerAddress, stringAnnotations, numericAnnotations)
+  console.log("arkivQuery", arkivQuery)
 
-  // Filter by owner_address if provided (stored in string_attributes)
-  if (ownerAddress) {
-    query += ` AND EXISTS (
-      SELECT 1 FROM string_attributes sa
-      WHERE sa.entity_key = p.entity_key
-        AND sa.from_block = p.from_block
-        AND sa.key = 'ownerAddress'
-        AND sa.value = ?
-    )`
-    params.push(ownerAddress)
-  }
-
-  // Filter by string annotations
-  if (stringAnnotations && Object.keys(stringAnnotations).length > 0) {
-    for (const [key, value] of Object.entries(stringAnnotations)) {
-      query += ` AND EXISTS (
-        SELECT 1 FROM string_attributes sa
-        WHERE sa.entity_key = p.entity_key
-          AND sa.from_block = p.from_block
-          AND sa.key = ?
-          AND sa.value = ?
-      )`
-      params.push(key, value)
-    }
-  }
-
-  // Filter by numeric annotations
-  if (numericAnnotations && Object.keys(numericAnnotations).length > 0) {
-    for (const [key, value] of Object.entries(numericAnnotations)) {
-      query += ` AND EXISTS (
-        SELECT 1 FROM numeric_attributes na
-        WHERE na.entity_key = p.entity_key
-          AND na.from_block = p.from_block
-          AND na.key = ?
-          AND na.value = ?
-      )`
-      params.push(key, value)
-    }
-  }
-
-  query += `
-    ORDER BY p.from_block DESC
-    LIMIT ? OFFSET ?
-  `
-  params.push(limit, offset)
-
-  const stmt = database.prepare(query)
-  const rows = stmt.all(...params) as any[]
+  // Execute query and get rows (now async)
+  const rows = await executeArkivQuery(database, arkivQuery, limit, offset)
 
   const duration = performance.now() - startTime
   logDbOperation(
@@ -437,7 +753,10 @@ export function queryEntities(
     if (withAnnotations || row.string_attributes) {
       if (row.string_attributes) {
         try {
-          stringAnnotations = JSON.parse(row.string_attributes)
+          const strAttrs = typeof row.string_attributes === "string" 
+            ? row.string_attributes 
+            : String(row.string_attributes)
+          stringAnnotations = JSON.parse(strAttrs) as Record<string, string>
         } catch (e) {
           console.warn(`Failed to parse string_attributes:`, e)
         }
@@ -447,7 +766,10 @@ export function queryEntities(
     if (withAnnotations || row.numeric_attributes) {
       if (row.numeric_attributes) {
         try {
-          numericAnnotations = JSON.parse(row.numeric_attributes)
+          const numAttrs = typeof row.numeric_attributes === "string"
+            ? row.numeric_attributes
+            : String(row.numeric_attributes)
+          numericAnnotations = JSON.parse(numAttrs) as Record<string, number>
         } catch (e) {
           console.warn(`Failed to parse numeric_attributes:`, e)
         }
@@ -455,19 +777,32 @@ export function queryEntities(
     }
 
     // Convert entity_key BLOB to string
+    // The Go tool returns entity_key, which may be Buffer or string
     const entityKey =
-      row.entity_key instanceof Buffer ? row.entity_key.toString("utf-8") : String(row.entity_key)
+      row.entity_key instanceof Buffer 
+        ? `0x${row.entity_key.toString("hex")}` 
+        : String(row.entity_key)
 
-    // Get owner_address from annotations
-    const ownerAddr = stringAnnotations?.ownerAddress || ""
+    // Get owner_address - the Go tool returns it as 'owner' column or from annotations
+    const ownerAddr = (row.owner as string) || stringAnnotations?.ownerAddress || ""
+
+    // Get expires_at - the Go tool returns it as 'expires_at' column
+    const expiresAt = (row.expires_at as number) || 0
+
+    // Convert payload - may be Buffer or null
+    const payload = row.payload instanceof Buffer 
+      ? row.payload 
+      : row.payload 
+        ? Buffer.from(String(row.payload), "base64")
+        : undefined
 
     return {
       key: entityKey,
-      expiresAt: row.to_block,
-      payload: row.payload,
-      contentType: row.content_type,
-      createdAtBlock: row.from_block,
-      lastModifiedAtBlock: row.from_block,
+      expiresAt: expiresAt,
+      payload: payload,
+      contentType: (row.content_type as string) || "",
+      createdAtBlock: (row.from_block as number) || 0,
+      lastModifiedAtBlock: (row.from_block as number) || 0,
       deleted: false,
       transactionIndexInBlock: 0,
       operationIndexInTransaction: 0,
@@ -581,6 +916,46 @@ export function cleanAllData(): void {
     // Reset last_block
     database.prepare("DELETE FROM last_block").run()
   })
+  // Clear query cache when cleaning data
+  queryCache.clear()
+}
+
+/**
+ * Clear the query cache.
+ * Useful when database schema or data changes significantly.
+ */
+/**
+ * Enable or disable the query cache.
+ * @param enabled - Whether to enable query caching (default: false)
+ */
+export function setQueryCacheEnabled(enabled: boolean): void {
+  queryCacheEnabled = enabled
+  if (!enabled) {
+    // Clear cache when disabling
+    queryCache.clear()
+  }
+}
+
+/**
+ * Check if query cache is currently enabled.
+ */
+export function isQueryCacheEnabled(): boolean {
+  return queryCacheEnabled
+}
+
+/**
+ * Clear the query cache.
+ * Useful when database schema or data changes significantly.
+ */
+export function clearQueryCache(): void {
+  queryCache.clear()
+}
+
+/**
+ * Get the current size of the query cache.
+ */
+export function getQueryCacheSize(): number {
+  return queryCache.size
 }
 
 export function vacuumDatabase(): void {

@@ -151,7 +151,7 @@ app.post("/entities/query", async (c) => {
   try {
     const body = (await c.req.json()) as EntityQueryRequest
 
-    const entities = queryEntities(
+    const entities = await queryEntities(
       body.ownerAddress,
       body.stringAnnotations,
       body.numericAnnotations,

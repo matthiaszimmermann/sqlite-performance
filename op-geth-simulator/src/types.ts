@@ -26,7 +26,7 @@ export interface EntityWriteRequest {
 
 export interface EntityQueryRequest {
   stringAnnotations?: Record<string, string>;
-  numericAnnotations?: Record<string, number>;
+  numericAnnotations?: Record<string, number | string>; // number for equality, string for range (e.g., ">=8", "<=32", ">16", "<64", "!=0")
   ownerAddress?: string;
   limit?: number;
   offset?: number;

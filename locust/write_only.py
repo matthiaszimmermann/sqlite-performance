@@ -50,11 +50,12 @@ def node_to_entity_request(node: NodeEntity, creator_address: str) -> Dict[str, 
     Transform a NodeEntity to EntityWriteRequest format for POST /entities endpoint.
     
     Similar to node_to_sql_inserts but returns a dict for JSON API.
-    Note: expiresIn is the number of blocks from current block, so we use node.ttl directly.
+    Note: expiresIn is the number of blocks from current block, using random value 100-1000.
     """
     entity_key = node.entity_key
     block = node.block
-    expires_at_block = block + node.ttl
+    ttl = random.randint(100, 1000)  # Random TTL between 100 and 1000 blocks
+    expires_at_block = block + ttl
     
     # String attributes (same as in node_to_sql_inserts)
     string_annotations = {
@@ -89,7 +90,7 @@ def node_to_entity_request(node: NodeEntity, creator_address: str) -> Dict[str, 
     
     return {
         "key": "0x" + entity_key.hex(),
-        "expiresIn": node.ttl,  # Number of blocks from current block
+        "expiresIn": ttl,  # Number of blocks from current block (random 100-1000)
         "payload": payload_base64,
         "contentType": "application/octet-stream",
         "ownerAddress": creator_address,
@@ -103,11 +104,12 @@ def workload_to_entity_request(workload: WorkloadEntity, creator_address: str) -
     Transform a WorkloadEntity to EntityWriteRequest format for POST /entities endpoint.
     
     Similar to workload_to_sql_inserts but returns a dict for JSON API.
-    Note: expiresIn is the number of blocks from current block, so we use workload.ttl directly.
+    Note: expiresIn is the number of blocks from current block, using random value 100-1000.
     """
     entity_key = workload.entity_key
     block = workload.block
-    expires_at_block = block + workload.ttl
+    ttl = random.randint(100, 1000)  # Random TTL between 100 and 1000 blocks
+    expires_at_block = block + ttl
     
     # String attributes (same as in workload_to_sql_inserts)
     string_annotations = {
@@ -142,7 +144,7 @@ def workload_to_entity_request(workload: WorkloadEntity, creator_address: str) -
     
     return {
         "key": "0x" + entity_key.hex(),
-        "expiresIn": workload.ttl,  # Number of blocks from current block
+        "expiresIn": ttl,  # Number of blocks from current block (random 100-1000)
         "payload": payload_base64,
         "contentType": "application/octet-stream",
         "ownerAddress": creator_address,

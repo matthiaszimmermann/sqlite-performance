@@ -5,6 +5,10 @@ This test performs read queries similar to query_dc_benchmark.py, using the same
 query types and weights. Sample data (node_ids, workload_ids, entity_keys) is
 pre-loaded globally once when the test starts.
 
+The test uses range queries for numeric annotations (>=, <=, >, <, !=) where
+appropriate, leveraging the extended queryEntities API that supports Arkiv query
+language with comparison operators.
+
 Usage:
     locust -f locust/read_only.py --host=http://localhost:3000
 """
@@ -307,17 +311,21 @@ class DataCenterReadUser(FastHttpUser):
     
     @task(25)  # 25% weight
     def node_filter(self):
-        """Find available nodes matching filter criteria."""
+        """Find available nodes matching filter criteria using range queries."""
         rng = random.Random()
         
         region = rng.choice(REGIONS)
         vm_type = rng.choice(VM_TYPES)
-        cpu_count = rng.choice([4, 8, 16, 32])
-        ram_gb = rng.choice([16, 32, 64, 128])
+        
+        # Use range queries for numeric attributes (>= operator)
+        # This allows finding nodes with at least the specified resources
+        min_cpu = rng.choice([4, 8, 16, 32])
+        min_ram = rng.choice([16, 32, 64, 128])
         
         # Build query with filters
-        # Note: The API only supports exact matches for numeric attributes,
-        # so we use exact values from common distributions
+        # The API now supports range queries for numeric attributes:
+        # - number: exact match (e.g., 8 -> "cpu_count = 8")
+        # - string with operator: range query (e.g., ">=8" -> "cpu_count >= 8")
         query: Dict[str, Any] = {
             "stringAnnotations": {
                 "status": "available",
@@ -326,15 +334,15 @@ class DataCenterReadUser(FastHttpUser):
                 "vm_type": vm_type,
             },
             "numericAnnotations": {
-                # Use exact values that are likely to exist
-                "cpu_count": cpu_count,
-                "ram_gb": ram_gb,
+                # Use range queries: find nodes with at least these resources
+                "cpu_count": f">={min_cpu}",  # cpu_count >= min_cpu
+                "ram_gb": f">={min_ram}",     # ram_gb >= min_ram
             },
             "limit": DEFAULT_NODE_LIMIT,
         }
         
         debug_log(f"[DEBUG] node_filter: querying status=available, type=node, region={region}, "
-              f"vm_type={vm_type}, cpu_count={cpu_count}, ram_gb={ram_gb}")
+              f"vm_type={vm_type}, cpu_count>={min_cpu}, ram_gb>={min_ram}")
         
         with self.client.post(
             "/entities/query",
