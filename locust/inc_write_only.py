@@ -35,11 +35,13 @@ class IncrementalWriteUser(FastHttpUser):
     """
     Locust user that writes entities with incrementally increasing attribute counts.
     
-    The progression is:
-    - First period: no attributes
-    - Next 6 periods: 1-6 numeric attributes (no string)
-    - Next 6 periods: 1-6 string attributes (no numeric)
-    - After that: 6 numeric + 6 string attributes constantly
+    The progression tests all combinations of numeric attributes (0-6) and string attributes (0-6).
+    That's 49 combinations total, ordered as:
+    - (0,0), (0,1), ..., (0,6)
+    - (1,0), (1,1), ..., (1,6)
+    - ...
+    - (6,0), (6,1), ..., (6,6)
+    - After all combinations: repeats (6,6)
     """
     wait_time = constant(1)  # One task per second
     
@@ -59,28 +61,27 @@ class IncrementalWriteUser(FastHttpUser):
         """
         Determine the number of numeric and string attributes based on task count.
         
+        Tests all combinations of numeric attributes (0-6) and string attributes (0-6).
+        That's 7 * 7 = 49 combinations total.
+        
+        Order: For each numeric count 0-6, iterate through string counts 0-6.
+        Example: (0,0), (0,1), ..., (0,6), (1,0), (1,1), ..., (1,6), ..., (6,6)
+        
         Returns:
             Tuple of (numeric_attr_count, string_attr_count)
         """
         period = self.task_count // self.period_runs
         
-        # First period (0): no attributes
-        if period == 0:
-            return (0, 0)
-        
-        # Periods 1-6: 1-6 numeric attributes
-        elif 1 <= period <= 6:
-            numeric_count = period
-            return (numeric_count, 0)
-        
-        # Periods 7-12: 1-6 string attributes (no numeric)
-        elif 7 <= period <= 12:
-            string_count = period - 6
-            return (0, string_count)
-        
-        # Period 13+: 6 numeric + 6 string attributes
-        else:
+        # Map period to combination: numeric = period // 7, string = period % 7
+        # This gives us all 49 combinations (0-6 for each, period 0-48)
+        # For periods >= 49, repeat the last combination (6,6)
+        if period >= 49:
             return (6, 6)
+        
+        numeric_count = period // 7
+        string_count = period % 7
+        
+        return (numeric_count, string_count)
     
     def generate_attributes(
         self, 
