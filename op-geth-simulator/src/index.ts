@@ -28,13 +28,28 @@ function parseDbPath(): string | undefined {
   return undefined
 }
 
+// Parse command-line arguments for test name
+function parseTestName(): string | undefined {
+  const args = process.argv.slice(2)
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--testname" && i + 1 < args.length) {
+      return args[i + 1]
+    }
+    if (args[i].startsWith("--testname=")) {
+      return args[i].split("=")[1]
+    }
+  }
+  return undefined
+}
+
 const dbPath = parseDbPath()
+const testName = parseTestName()
 
 // Initialize database
 initDatabase(dbPath)
 
 // Start block processor
-startBlockProcessor()
+startBlockProcessor(testName)
 
 // Graceful shutdown
 process.on("SIGINT", () => {

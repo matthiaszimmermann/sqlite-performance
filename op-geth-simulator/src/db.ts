@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Database } from "bun:sqlite"
-import { logQueryWarning } from "./logger.js"
+import { logQueryWarning, logQuery } from "./logger.js"
 import type { Entity, PendingEntity } from "./types.js"
 
 // Connection pool configuration
@@ -184,10 +184,10 @@ export function insertEntity(entity: Entity): void {
 
   // Serialize annotations to JSON for storage in payloads table
   const stringAttributesJson =
-    Object.keys(stringAnnotations).length > 0 ? JSON.stringify(stringAnnotations) : null
+    Object.keys(stringAnnotations).length > 0 ? JSON.stringify(stringAnnotations) : "{}"
   const numericAttributesJson = entity.numericAnnotations
     ? JSON.stringify(entity.numericAnnotations)
-    : null
+    : "{}"
 
   // Insert into payloads table
   // from_block uses lastModifiedAtBlock, to_block uses expiresAt
@@ -301,6 +301,8 @@ export function getEntityByKey(key: string): Entity | null {
   if (!row) {
     const duration = performance.now() - startTime
     logDbOperation(`getEntityByKey(key=${key}) - not found`, duration)
+    // Log query details even when entity is not found
+    logQuery("getEntityByKey", duration, { key, found: false })
     return null
   }
 
@@ -332,6 +334,9 @@ export function getEntityByKey(key: string): Entity | null {
 
   const duration = performance.now() - startTime
   logDbOperation(`getEntityByKey(key=${key})`, duration)
+
+  // Log query details to query.log
+  logQuery("getEntityByKey", duration, { key, found: true })
 
   return {
     key: entityKey,
@@ -811,6 +816,20 @@ export async function queryEntities(
       numericAnnotations: numericAnnotations,
     }
   })
+
+  // Log query details to query.log
+  logQuery(
+    "queryEntities",
+    duration,
+    {
+      ownerAddress: ownerAddress || null,
+      stringAnnotations: stringAnnotations || null,
+      numericAnnotations: numericAnnotations || null,
+      limit,
+      offset,
+      rowCount: rows.length,
+    },
+  )
 
   return result
 }
