@@ -519,21 +519,15 @@ function parseArkivQuery(arkivQuery: string): ParsedCondition[] {
   return conditions
 }
 
-/**
- * Generate unique alias for attribute join
- */
-function generateAttributeAlias(seed: number): string {
-  // Generate a unique alias similar to Go tool: arkiv_attr_<number>
-  return `arkiv_attr_${Math.abs(seed)}`
-}
 
 /**
- * Convert Arkiv query string to SQL query.
+ * Convert Arkiv query string to SQL query using CTEs with INTERSECT.
  * 
  * Pattern:
- * - Each string/numeric annotation gets an INNER JOIN
- * - LEFT JOINs for owner and expiration attributes
- * - WHERE clause filters by current block and attribute values
+ * - Each attribute condition gets its own CTE (table_1, table_2, table_4, etc.)
+ * - After each pair, create an INTERSECT CTE (table_3 = table_1 INTERSECT table_2)
+ * - Final table is DISTINCT
+ * - Final SELECT joins the intersected keys with payloads
  */
 function buildSqlFromArkivQuery(
   arkivQuery: string,
@@ -543,123 +537,67 @@ function buildSqlFromArkivQuery(
 ): { sqlQuery: string; params: (string | number)[] } {
   const conditions = parseArkivQuery(arkivQuery)
   
-  // Separate string and numeric conditions
-  const stringConditions: ParsedCondition[] = []
-  const numericConditions: ParsedCondition[] = []
-  
-  for (const cond of conditions) {
-    if (cond.isNumeric) {
-      numericConditions.push(cond)
-    } else {
-      stringConditions.push(cond)
-    }
+  // If no conditions, return simple query
+  if (conditions.length === 0) {
+    const sqlQuery = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM payloads AS e LEFT JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' LEFT JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE $1 BETWEEN e.from_block AND e.to_block - 1 ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
+    return { sqlQuery, params: [currentBlock] }
   }
 
-  // Build SELECT clause
-  const selectClause = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes`
-
-  // Build FROM clause
-  const fromClause = `FROM payloads AS e`
-
-  // Build INNER JOINs for string attributes
-  const stringJoins: string[] = []
-  const stringJoinAliases: string[] = []
-  let aliasSeed = 0
-
-  for (let i = 0; i < stringConditions.length; i++) {
-    const alias = generateAttributeAlias(aliasSeed++)
-    stringJoinAliases.push(alias)
-    stringJoins.push(
-      `INNER JOIN string_attributes AS ${alias} ON e.entity_key = ${alias}.entity_key AND e.from_block = ${alias}.from_block AND ${alias}.key = ?`
-    )
-  }
-
-  // Build INNER JOINs for numeric attributes
-  const numericJoins: string[] = []
-  const numericJoinAliases: string[] = []
-
-  for (let i = 0; i < numericConditions.length; i++) {
-    const alias = generateAttributeAlias(aliasSeed++)
-    numericJoinAliases.push(alias)
-    numericJoins.push(
-      `INNER JOIN numeric_attributes AS ${alias} ON e.entity_key = ${alias}.entity_key AND e.from_block = ${alias}.from_block AND ${alias}.key = ?`
-    )
-  }
-
-  // Build LEFT JOINs for owner and expiration
-  const leftJoins = [
-    `LEFT JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner'`,
-    `LEFT JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration'`,
-  ]
-
-  // Build WHERE clause
-  const whereConditions: string[] = []
-  whereConditions.push(`? BETWEEN e.from_block AND e.to_block - 1`)
-
-  // Add attribute value filters
-  const valueFilters: string[] = []
-  
-  for (let i = 0; i < stringConditions.length; i++) {
-    const alias = stringJoinAliases[i]
-    valueFilters.push(`${alias}.value = ?`)
-  }
-
-  for (let i = 0; i < numericConditions.length; i++) {
-    const alias = numericJoinAliases[i]
-    const numericCond = numericConditions[i]
-    valueFilters.push(`${alias}.value ${numericCond.operator} ?`)
-  }
-
-  if (valueFilters.length > 0) {
-    whereConditions.push(`(${valueFilters.join(" AND ")})`)
-  }
-
-  // Build ORDER BY and LIMIT
-  const orderByClause = `ORDER BY from_block, entity_key`
-  const limitClause = `LIMIT ${limit}`
-  const offsetClause = offset > 0 ? `OFFSET ${offset}` : ""
-
-  // Combine all parts
-  const allJoins = [...stringJoins, ...numericJoins, ...leftJoins]
-  const sqlQuery = [
-    selectClause,
-    fromClause,
-    ...allJoins,
-    `WHERE ${whereConditions.join(" AND ")}`,
-    orderByClause,
-    limitClause,
-    offsetClause,
-  ]
-    .filter((part) => part !== "")
-    .join(" ")
-
-  // Build parameters array
-  // Order: attribute keys (string then numeric), current_block, attribute values (string then numeric)
+  const ctes: string[] = []
   const params: (string | number)[] = []
-  
-  // Attribute keys (string attributes first)
-  for (const cond of stringConditions) {
+  let paramIndex = 1
+
+  // Step 1: Build CTEs for each condition (table_1, table_2, table_4, table_6, table_8, table_10, ...)
+  // Note: table numbers skip for intersect tables, but we'll number them sequentially first
+  for (let i = 0; i < conditions.length; i++) {
+    const cond = conditions[i]
+    const tableNum = i + 1
+    const tableName = `table_${tableNum}`
+    const attrTable = cond.isNumeric ? "numeric_attributes" : "string_attributes"
+    const valueOperator = cond.isNumeric ? cond.operator : "="
+    
+    // Build CTE: SELECT entity_key, from_block from attributes joined with payloads
+    const cte = `${tableName} AS (SELECT e.entity_key, e.from_block FROM ${attrTable} AS a INNER JOIN payloads AS e ON a.entity_key = e.entity_key AND a.from_block = e.from_block AND $${paramIndex + 2} BETWEEN e.from_block AND e.to_block - 1 WHERE key = $${paramIndex} AND value ${valueOperator} $${paramIndex + 1})`
+    
+    ctes.push(cte)
+    
+    // Parameters: key, value, currentBlock
     params.push(cond.key)
-  }
-  
-  // Attribute keys (numeric attributes)
-  for (const cond of numericConditions) {
-    params.push(cond.key)
+    params.push(cond.value as string | number)
+    params.push(currentBlock)
+    
+    paramIndex += 3
   }
 
-  // Current block parameter
+  // Step 2: Build INTERSECT chain
+  // For N conditions, we need N-1 intersections
+  // Pattern: table_3 = table_1 INTERSECT table_2, table_5 = table_3 INTERSECT table_4, etc.
+  let nextIntersectTableNum = conditions.length + 1
+  let lastTable = "table_1"
+  
+  for (let i = 1; i < conditions.length; i++) {
+    const currentTable = `table_${i + 1}`
+    const intersectTable = `table_${nextIntersectTableNum}`
+    const isLast = i === conditions.length - 1
+    
+    if (isLast) {
+      // Last intersection - make it DISTINCT
+      ctes.push(`${intersectTable} AS (SELECT DISTINCT * FROM ${lastTable} INTERSECT SELECT * FROM ${currentTable})`)
+    } else {
+      ctes.push(`${intersectTable} AS (SELECT * FROM ${lastTable} INTERSECT SELECT * FROM ${currentTable})`)
+    }
+    
+    lastTable = intersectTable
+    nextIntersectTableNum++
+  }
+
+  // Step 3: Build final SELECT
+  const finalTable = conditions.length === 1 ? "table_1" : `table_${nextIntersectTableNum - 1}`
+  const finalSelect = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM ${finalTable} AS keys INNER JOIN payloads AS e ON keys.entity_key = e.entity_key AND keys.from_block = e.from_block INNER JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' INNER JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE $${paramIndex} BETWEEN e.from_block AND e.to_block ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
+  
   params.push(currentBlock)
   
-  // Attribute values (string attributes)
-  for (const cond of stringConditions) {
-    params.push(cond.value as string)
-  }
-  
-  // Attribute values (numeric attributes)
-  for (const cond of numericConditions) {
-    params.push(cond.value as number)
-  }
-
+  const sqlQuery = `WITH ${ctes.join(", ")} ${finalSelect}`
   return { sqlQuery, params }
 }
 
