@@ -74,7 +74,7 @@ export function logQuery(
   
   // Format: testname queryType duration_ms num_params
   // Similar to processing.log: <testname> <queryType> <duration_ms> <num_params>
-  const logLine = `${testName} ${queryType} ${Math.round(duration)} ${paramCount}\n`
+  const logLine = `${new Date().toISOString()} ${testName} ${queryType} ${Math.round(duration)} ${paramCount} ${JSON.stringify(params)}\n`
   
   try {
     appendFileSync(QUERY_LOG_FILE, logLine, "utf-8")
