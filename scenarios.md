@@ -10,7 +10,7 @@ This document describes realistic use cases for arkiv entity management, based o
   - [Candidate Use Cases](#candidate-use-cases)
   - [Comparison Matrix](#comparison-matrix)
   - [Selected Use Cases for Deep Dive](#selected-use-cases-for-deep-dive)
-- [Use Case 1: Decentralized Data Center](#use-case-1-decentralized-data-center)
+- [Use Case 1: Decentralized Compute Marketplace](#use-case-1-decentralized-compute-marketplace)
 - [Use Case 2: Decentralized Ride-Sharing](#use-case-2-decentralized-ride-sharing)
 - [Use Case 3: Decentralized Freelance/Gig Platform](#use-case-3-decentralized-freelancegig-platform)
 - [Use Case 4: Decentralized Supply Chain Tracking](#use-case-4-decentralized-supply-chain-tracking)
@@ -23,6 +23,20 @@ This document describes realistic use cases for arkiv entity management, based o
   - [Comparison Across Use Cases](#comparison-across-use-cases)
   - [Use Case Fit Assessment](#use-case-fit-assessment)
   - [Recommended Priority Order](#recommended-priority-order)
+- [Compute Marketplace Performance Requirements Framework](#compute-marketplace-performance-requirements-framework)
+  - [Context: 300K Node Compute Marketplace](#context-300k-node-compute-marketplace)
+  - [Write Performance Requirements](#write-performance-requirements)
+    - [Node Entity Updates](#node-entity-updates)
+    - [Workload Entity Creations/Updates](#workload-entity-creationsupdates)
+    - [Combined Write Load](#combined-write-load)
+  - [Read Performance Requirements](#read-performance-requirements)
+    - [Problem Statement](#problem-statement)
+    - [Design Goals](#design-goals)
+    - [Resource-Driven Age-Based Bucket Strategy](#resource-driven-age-based-bucket-strategy)
+    - [Query Estimates](#query-estimates)
+    - [Combined Read/Write Load](#combined-readwrite-load)
+  - [Performance Framework Summary](#performance-framework-summary)
+  - [Next Steps for Validation](#next-steps-for-validation)
 - [Performance Assumptions](#performance-assumptions)
 
 ---
@@ -35,7 +49,7 @@ Before diving into specific scenarios, here's a comparative analysis of potentia
 
 | Category | Use Case | Description |
 |----------|----------|-------------|
-| **Infrastructure** | Data Center | Decentralized compute resource management |
+| **Infrastructure** | Compute Marketplace | Decentralized compute resource management |
 | **Infrastructure** | Energy Grid | Peer-to-peer energy trading and grid management |
 | **Mobility** | Ride-Sharing | Decentralized alternative to Uber/Lyft |
 | **Mobility** | Fleet Management | Logistics and delivery coordination |
@@ -52,7 +66,7 @@ Before diving into specific scenarios, here's a comparative analysis of potentia
 
 | Use Case | Entities | Update Frequency | Decentralization Value | Arkiv Fit | Real-World Traction |
 |----------|----------|------------------|------------------------|-----------|---------------------|
-| **Data Center** | 600K | Periodic | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| **Compute Marketplace** | 600K | Periodic | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
 | **Ride-Sharing** | 50M+ | Real-time | ⭐⭐⭐⭐⭐ | ⭐⭐ | ⭐⭐⭐⭐ |
 | **Supply Chain** | 10M | Checkpoint | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 | **Fleet Management** | 1M | Minutes | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
@@ -88,7 +102,7 @@ Based on strategic fit, technical feasibility, and real-world relevance, we expl
 
 | # | Use Case | Rationale |
 |---|----------|-----------|
-| 1 | **Data Center** | Historical context (Golem), ongoing partner collaboration |
+| 1 | **Compute Marketplace** | Historical context (Golem), ongoing partner collaboration |
 | 2 | **Ride-Sharing** | Strong decentralization story, tests arkiv at scale limits |
 | 3 | **Freelance/Gig Platform** | Worker ownership narrative, manageable update patterns |
 | 4 | **Supply Chain Tracking** | Excellent multi-party fit, proven enterprise demand |
@@ -97,13 +111,13 @@ Based on strategic fit, technical feasibility, and real-world relevance, we expl
 
 ---
 
-## Use Case 1: Decentralized Data Center
+## Use Case 1: Decentralized Compute Marketplace
 
-### Context: Hyperscaler Data Center Landscape
+### Context: Hyperscaler Compute Landscape
 
 Major cloud providers operate extensive global infrastructure:
 
-| Company | Data Centers | Regions |
+| Company | Compute Facilities | Regions |
 |---------|--------------|---------|
 | Amazon (AWS) | ~100+ | 33 regions, 105 AZs |
 | Microsoft Azure | ~60+ | 60+ regions |
@@ -168,15 +182,15 @@ Decentralized compute requires coordination across untrusting parties:
 
 ### Scale Context
 
-Each large facility typically houses **100,000–500,000 servers**. The 100K node scenario modeled here represents a **single medium-to-large hyperscaler data center**—the kind of facility that would be managed as one logical unit for workload scheduling and capacity planning.
+Each large facility typically houses **100,000–500,000 servers**. The 300K node scenario modeled here represents a **large-scale balanced compute marketplace network**—the kind of scale that would emerge in a mature decentralized compute ecosystem where supply and demand are in reasonable equilibrium.
 
-Based on our SQLite performance experiments, **a single arkiv database chain is more than sufficient to manage a medium-to-large data center**. With ~621K entities and ~14M attributes, this scenario requires only 70-80% of the capacity demonstrated with the mendoza benchmark data. A full state sync completes in ~15 minutes, and steady-state updates of 10K-50K attributes/sec are well within arkiv's throughput capabilities.
+Based on our SQLite performance experiments, **a single arkiv database chain is more than sufficient to manage a large compute marketplace**. With ~663K entities and ~15.3M attributes, this scenario requires only 80-85% of the capacity demonstrated with the mendoza benchmark data. A full state sync completes in ~20 minutes, and steady-state updates of 170-235 entities/sec (with peaks up to 1,600 entities/sec) are well within arkiv's throughput capabilities.
 
-In a decentralized architecture, each data center (or provider network segment) maintains its own local arkiv chain for node and workload state, while participating in a broader coordination layer for cross-network visibility.
+In a decentralized architecture, each provider network maintains its own local arkiv chain for node and workload state, while participating in a broader coordination layer for cross-network visibility.
 
 ### Overview
 
-A decentralized compute network managing 100K nodes and 500K workloads across multiple providers, enabling censorship-resistant, resilient workload distribution.
+A decentralized compute network managing 300K nodes and 300K workloads across multiple providers, enabling censorship-resistant, resilient workload distribution.
 
 ### Infrastructure Entities
 
@@ -266,50 +280,50 @@ A decentralized compute network managing 100K nodes and 500K workloads across mu
 | Entity Type | Count | String Attrs | Numeric Attrs | Total Attrs |
 |-------------|-------|--------------|---------------|-------------|
 | **Infrastructure** | | | | |
-| Nodes | 100,000 | 12 | 15 | 2,700,000 |
-| Racks | 2,500 | 5 | 4 | 22,500 |
-| Rows | 250 | 4 | 3 | 1,750 |
-| Rooms | 25 | 5 | 4 | 225 |
-| Switches | 5,000 | 6 | 5 | 55,000 |
-| PDUs | 5,000 | 4 | 6 | 50,000 |
-| Cooling | 100 | 3 | 5 | 800 |
+| Nodes | 300,000 | 12 | 15 | 8,100,000 |
+| Racks | 7,500 | 5 | 4 | 67,500 |
+| Rows | 750 | 4 | 3 | 5,250 |
+| Rooms | 75 | 5 | 4 | 675 |
+| Switches | 15,000 | 6 | 5 | 165,000 |
+| PDUs | 15,000 | 4 | 6 | 150,000 |
+| Cooling | 300 | 3 | 5 | 2,400 |
 | **Workloads** | | | | |
-| Workloads | 500,000 | 12 | 10 | 11,000,000 |
-| Workload Templates | 1,000 | 10 | 8 | 18,000 |
-| Placement Groups | 5,000 | 5 | 2 | 35,000 |
-| Resource Quotas | 500 | 2 | 12 | 7,000 |
+| Workloads | 300,000 | 12 | 10 | 6,600,000 |
+| Workload Templates | 3,000 | 10 | 8 | 54,000 |
+| Placement Groups | 15,000 | 5 | 2 | 105,000 |
+| Resource Quotas | 1,500 | 2 | 12 | 21,000 |
 | **Management** | | | | |
-| Workload Classes | 50 | 4 | 2 | 300 |
-| Tenants | 500 | 5 | 3 | 4,000 |
-| Maintenance Windows | 100 | 4 | 3 | 700 |
-| Alert Rules | 1,000 | 6 | 4 | 10,000 |
-| **Total** | **~621,000** | | | **~13.9M** |
+| Workload Classes | 150 | 4 | 2 | 900 |
+| Tenants | 1,500 | 5 | 3 | 12,000 |
+| Maintenance Windows | 300 | 4 | 3 | 2,100 |
+| Alert Rules | 3,000 | 6 | 4 | 30,000 |
+| **Total** | **~663,000** | | | **~15.3M** |
 
 ### Grand Total
 
 | Metric | Value |
 |--------|-------|
-| **Entities** | ~621,000 |
-| **Total Attributes** | ~13.9 million |
-| **Payloads** | ~115,000 (config blobs, ~5KB avg) |
+| **Entities** | ~663,000 |
+| **Total Attributes** | ~15.3 million |
+| **Payloads** | ~345,000 (config blobs, ~5KB avg) |
 
 ### Comparison to Mendoza Benchmark Data
 
 | Metric | Mendoza | Decentralized DC | Ratio |
 |--------|---------|------------------|-------|
-| Entities | 800K | 621K | 0.78x |
+| Entities | 800K | 663K | 0.83x |
 | String attrs | 12M | ~7.6M | 0.63x |
 | Numeric attrs | 7.3M | ~6.3M | 0.86x |
-| Total attrs | 19.4M | ~13.9M | 0.72x |
+| Total attrs | 19.4M | ~15.3M | 0.79x |
 
-**Conclusion**: A decentralized data center with 100K nodes and 500K workloads would require roughly **70-80% of the mendoza dataset size** — within SQLite's comfortable range based on our benchmarks.
+**Conclusion**: A decentralized compute marketplace with 300K nodes and 300K workloads would require roughly **80-85% of the mendoza dataset size** — within SQLite's comfortable range based on our benchmarks.
 
 ### Scaling Projections
 
 | Scale | Nodes | Workloads | Total Entities | Total Attrs | Full Sync |
 |-------|-------|-----------|----------------|-------------|-----------|
 | Small | 10K | 50K | ~62K | ~1.4M | ~1.5 min |
-| Medium | 100K | 500K | ~621K | ~13.9M | ~15 min |
+| Medium | 300K | 300K | ~663K | ~15.3M | ~20 min |
 | Large | 500K | 2.5M | ~3.1M | ~70M | ~74 min |
 | XL | 1M | 5M | ~6.2M | ~140M | ~148 min |
 
@@ -357,11 +371,11 @@ For a 100K node / 500K workload system with typical update patterns:
 
 Based on our benchmarks (~6,400 rows/sec), this is achievable for steady state but may require batching or optimization for burst scenarios.
 
-### Arkiv Requirements: Data Center
+### Arkiv Requirements: Compute Marketplace
 
 | Requirement | Value | Notes |
 |-------------|-------|-------|
-| **Entities** | 621K | Per data center / provider network |
+| **Entities** | 663K | Per provider network |
 | **Attributes** | 13.9M | ~22 attrs/entity average |
 | **Writes/sec** | 10K-50K | Steady state; burst to 500K during rebalancing |
 | **Reads/sec** | 1K-10K | Workload matching, node queries |
@@ -571,7 +585,7 @@ These are the key questions that need experimental validation:
 | Max entities per chain? | 800K (mendoza) | 52M (North America) | **65x** |
 | Max attributes per chain? | 19M (mendoza) | 700M (North America) | **37x** |
 | Write throughput? | ~6,400 rows/sec | ~50K updates/sec (peak) | **8x** |
-| Full sync time? | ~15 min (621K entities) | <1 hour (52M entities) | TBD |
+| Full sync time? | ~20 min (663K entities) | <1 hour (52M entities) | TBD |
 | DB file size? | 13.35 GB (mendoza) | ~50-100 GB estimated | TBD |
 
 #### Proposed Experiments
@@ -1292,8 +1306,8 @@ How well does the mendoza dataset align with the proposed use cases?
 
 | Aspect | Mendoza Reality | Use Case Match |
 |--------|-----------------|----------------|
-| **Entity scale (800K)** | Proven capacity | Data Center (621K) fits perfectly |
-| **Attributes/entity (~24)** | Realistic distribution | Data Center (22), Carbon (11) similar |
+| **Entity scale (800K)** | Proven capacity | Compute Marketplace (663K) fits perfectly |
+| **Attributes/entity (~24)** | Realistic distribution | Compute Marketplace (22), Carbon (11) similar |
 | **Bi-temporal storage** | `from_block`/`to_block` tracking | Supply Chain provenance, Carbon retirement history |
 | **Event-driven updates** | ~700 entities/sec, not real-time | Carbon Credits (~500/sec), Supply Chain (~500/sec) |
 | **EAV schema flexibility** | 134 distinct entity types | Multi-entity use cases supported |
@@ -1321,9 +1335,9 @@ How well does the mendoza dataset align with the proposed use cases?
 
 ### Quantitative Comparison
 
-| Metric | Mendoza | Data Center | Carbon V1 | Energy Grid | Ride-Share City |
+| Metric | Mendoza | Compute Marketplace | Carbon V1 | Energy Grid | Ride-Share City |
 |--------|---------|-------------|-----------|-------------|-----------------|
-| **Entities** | 800K | 621K (0.78x) ✅ | 22M (27x) ⚠️ | 16M (20x) ⚠️ | 2.3M (2.9x) ✅ |
+| **Entities** | 800K | 663K (0.83x) ✅ | 22M (27x) ⚠️ | 16M (20x) ⚠️ | 2.3M (2.9x) ✅ |
 | **Attributes** | 19.4M | 13.9M (0.72x) ✅ | 250M (13x) ⚠️ | 190M (10x) ⚠️ | 21.8M (1.1x) ✅ |
 | **Entity types** | 134 | 14 | 7 | 4 | 6 |
 | **Writes/sec** | ~6,400 | 10K-50K ⚠️ | 50-500 ✅ | 5K-10K ✅ | 22K ⚠️ |
@@ -1333,7 +1347,7 @@ How well does the mendoza dataset align with the proposed use cases?
 | Action | Priority | Rationale |
 |--------|----------|-----------|
 | **Add query benchmarks** | Critical | All use cases require read performance data |
-| **Test sustained writes** | High | Validate 10K-50K writes/sec for Data Center |
+| **Test sustained writes** | High | Validate steady-state writes for Compute Marketplace |
 | **Implement entity relations** | High | Current string-based refs are inefficient |
 | **Test 10x scale** | Medium | Validate Carbon/Energy Grid feasibility |
 | **Add state-machine tests** | Medium | Lifecycle transitions (Ride, Job, Order) |
@@ -1377,7 +1391,7 @@ SQLite has practical limits that affect use case viability. While official limit
 
 | Use Case | Entities | Attributes | Rows | SQLite Fit | Writes/sec | Reads/sec | Chains | DB Size |
 |----------|----------|------------|------|------------|------------|-----------|--------|---------|
-| **Data Center** | 621K | 13.9M | 14M | 🟢 | 10K-50K | 1K-10K | 🟢 1/DC | 🟢 ~10 GB |
+| **Compute Marketplace** | 663K | 15.3M | 15.3M | 🟢 | 170-1,600 | 120-1,500 | 🟢 1/network | 🟢 ~12 GB |
 | **Ride-Sharing (City)** | 2.3M | 21.8M | 22M | 🟢 | 22K | 50K+ | 🔴 500 | 🟢 ~15 GB |
 | **Ride-Sharing (Region)** | 52M | 700M | 700M | 🔴 | 50K | 100K+ | 🟢 6 | 🟢 ~500 GB |
 | **Freelance Platform** | 50M | 500M | 500M | 🟡 | 2K-10K | 20K-50K | 🟢 6 | 🟢 ~350 GB |
@@ -1398,15 +1412,15 @@ SQLite has practical limits that affect use case viability. While official limit
 
 | Metric | Mendoza Benchmark | Best Fit | Stretch | Beyond Current |
 |--------|-------------------|----------|---------|----------------|
-| **Entities** | 800K | Data Center (621K) | Carbon V1 (22M) | Ride-Share Region (52M) |
-| **Attributes** | 19.4M | Data Center (13.9M) | Energy Grid (190M) | Ride-Share Region (700M) |
+| **Entities** | 800K | Compute Marketplace (663K) | Carbon V1 (22M) | Ride-Share Region (52M) |
+| **Attributes** | 19.4M | Compute Marketplace (13.9M) | Energy Grid (190M) | Ride-Share Region (700M) |
 | **Writes/sec** | 6.4K | Carbon (500) | Energy (10K) | Ride-Share (50K) |
 
 ### Use Case Fit Assessment
 
 | Use Case | Within Current Capacity | Needs 10x Scale | Needs 50x+ Scale |
 |----------|-------------------------|-----------------|------------------|
-| **Data Center** | ✅ Perfect fit | — | — |
+| **Compute Marketplace** | ✅ Perfect fit | — | — |
 | **Carbon Credits V1** | ⚠️ 27x entities | — | — |
 | **Energy Grid** | ⚠️ 20x entities | — | — |
 | **Supply Chain V1** | ⚠️ 75x entities | — | — |
@@ -1420,12 +1434,278 @@ Based on arkiv fit and strategic value:
 
 | Priority | Use Case | Rationale |
 |----------|----------|-----------|
-| **1** | Data Center | Perfect fit, existing relationships (Golem), validates arkiv |
+| **1** | Compute Marketplace | Perfect fit, existing relationships (Golem), validates arkiv |
 | **2** | Carbon Credits V1 | Low writes, high value, single global chain |
 | **3** | Energy Grid | Regional fit, growing market, 15-min intervals |
 | **4** | Supply Chain V1 | Checkpoint-based, pharma/luxury vertical |
 | **5** | Freelance Platform | Event-driven, but needs scale validation |
 | **6** | Ride-Sharing | Compelling story, but requires significant scale-up |
+
+---
+
+# Compute Marketplace Performance Requirements Framework
+
+## Context: 300K Node Compute Marketplace
+
+A realistic performance model for a 300K node decentralized compute marketplace with workload scheduling.
+
+## 1. Write Performance Requirements
+
+### 1.1 Node Entity Updates
+
+**Model Parameters:**
+- 300K nodes (physical capacity)
+- 300K total workloads in system (steady state with housekeeping)
+- 195K workloads running at any time (65% node utilization)
+- 105K workloads pending (waiting for nodes)
+- Average workload duration: 5 hours
+- **Workload throughput: 195K running / 5h = 39K/hour = 10.8 workloads/sec**
+
+**Marketplace Dynamics:** This model represents a **balanced marketplace** where supply and demand are in reasonable equilibrium. The 105K pending queue means ~2.7 hours to clear if no new workloads arrive. Alternative scenarios:
+
+| Scenario | Available Nodes | Pending Queue | Queue Depth | Market State |
+|----------|----------------|---------------|-------------|-------------|
+| **Demand-Heavy** | 30K (30%) | 400K | ~20 hours | Under-supplied, high prices |
+| **Balanced Market** (modeled) | 90K (30%) | 105K | ~2.7 hours | Healthy equilibrium |
+| **Supply-Heavy** | 150K (50%) | 5K | <30 min | Over-supplied, low prices, idle nodes |
+
+The balanced model represents a mature marketplace with healthy queue depths and reasonable wait times. Dynamic pricing helps maintain this equilibrium by adjusting to supply/demand fluctuations.
+
+**Node Status Update Drivers:**
+
+```
+Workload assignments:  10.8 nodes/sec (available → busy)
+Workload completions:  10.8 nodes/sec (busy → available)
+Hardware failures:     1.5 nodes/sec (any → offline)
+Maintenance returns:   1.5 nodes/sec (offline → available)
+                       ────────────────────────────────────
+Node status changes:   ~24 nodes/sec
+```
+
+**Other Node Updates:**
+
+| Update Type | Frequency | Trigger | Entities/Update | Notes |
+|-------------|-----------|---------|-----------------|-------|
+| **Status Changes** | Continuous | Workload lifecycle + failures | ~24 nodes/sec | Driven by 10.8 workloads/sec throughput |
+| **Health Metrics** | Conditional | Metrics change >10% | ~30-45 nodes/sec | Event-driven: cpu_util, mem_util, disk_util |
+| **Config Updates** | Hourly-Daily | Software updates, patches | 300-15000 nodes | Rolling updates, staged deployments |
+| **Hardware Changes** | Weekly-Monthly | Physical maintenance | 30-300 nodes | Rack moves, upgrades, decommissions |
+
+**Health Metrics Strategy:** Each node checks its health every minute (CPU, memory, disk utilization). Updates are only written when metrics change substantially (>10 percentage points) or cross critical thresholds (>80%, >90%). This event-driven approach captures important state changes while avoiding redundant writes for stable nodes. Most nodes (70%) have stable workloads and write infrequently, while active or problematic nodes write more often, providing real-time visibility where it matters.
+
+**Write Load Calculation:**
+
+```
+Status changes:        24 nodes/sec (includes matching: available→busy, busy→available)
+Health metrics:        30-45 nodes/sec (conditional writes on substantial change)
+Config updates:        1,500 nodes / 3600 sec = 0.42 nodes/sec
+                       ───────────────────────────────────
+Total steady-state:    ~54-69 node entities/sec
+```
+
+**Peak scenarios:**
+- **Mass node failure**: 3,000 nodes in <10 sec = **300 nodes/sec spike** (status + health)
+- **Rolling restart**: 30K nodes/hour = **8 nodes/sec** for 1 hour
+
+### 1.2 Workload Entity Creations/Updates
+
+**Operational Dynamics:**
+
+| Update Type | Frequency | Trigger | Entities/Operation | Notes |
+|-------------|-----------|---------|-------------------|-------|
+| **New Workloads** | Continuous | User submissions | 10-80 workloads/sec | Varies by time of day, bursty |
+| **Workload Scheduling** | Continuous | Matcher assigns to node | 10-80 workloads/sec | status: pending→running, assigned_node |
+| **Workload Completion** | Continuous | Job finishes | 10-80 workloads/sec | status: running→completed, resource release |
+| **Workload Failures** | Occasional | Timeout, OOM, crashes | 0.5-10 workloads/sec | status: running→failed, retry_count++ |
+| **Resource Updates** | Conditional | Usage change >20% | ~50-100 workloads/sec | Event-driven: actual_cpu, actual_mem |
+
+**Workload Lifecycle:**
+
+```
+pending (new) → running (scheduled) → completed/failed (done)
+              ↓                      ↓
+         2 attrs update        2-3 attrs update
+```
+
+**Write Load Calculation:**
+
+```
+New submissions:       20 workloads/sec (create)
+Scheduling (assign):   20 workloads/sec (update)
+Completions:           20 workloads/sec (update)
+Failures:              2 workloads/sec (update)
+Resource updates:      100-200 workloads/sec (conditional: usage change >20%)
+                       ─────────────────────────────────────────
+Total steady-state:    ~160-260 workload entities/sec
+```
+
+**Resource Update Strategy:** Similar to health metrics, workloads check their actual resource usage every minute. Updates are only written when usage changes substantially (>20% deviation from last reported values). This captures meaningful billing/SLA events while avoiding redundant writes for stable workloads.
+
+**Peak scenarios:**
+- **Batch job submission**: Constrained by block capacity (2-sec blocks) = **~200 workloads/sec** (create)
+- **Mass completion** (batch done): 3,000 workloads / 10 sec = **300 workloads/sec** (update)
+- **Resource usage spike**: Many workloads change usage simultaneously = **~1,000 workloads/sec** (brief)
+
+### 1.3 Combined Write Load
+
+| Scenario | Node Updates | Workload Updates | Total | Peak Duration |
+|----------|--------------|------------------|-------|---------------|
+| **Steady-state** | 54-69 entities/sec | 115-165 entities/sec | **~170-235 entities/sec** | Continuous |
+| **Batch submission** | 54-69 entities/sec | 200 entities/sec | **~255-270 entities/sec** | Block rate limited |
+| **Resource usage spike** | 54-69 entities/sec | 1,000 entities/sec | **~1,050-1,070 entities/sec** | Brief, occasional |
+| **Mass node failure** | 300 entities/sec | 115-165 entities/sec | **~415-465 entities/sec** | <10 sec, rare |
+| **Mass job completion** | 54-69 entities/sec | 300 entities/sec | **~355-370 entities/sec** | ~10 sec, occasional |
+
+**Design Target:**
+- **Sustained**: 250 entities/sec (accounts for steady-state + normal bursts)
+- **Peak**: 1,600 entities/sec (handles resource usage spikes + mass failures)
+- **Batch size**: 100-500 entity updates per transaction
+
+## 2. Read Performance Requirements
+
+### 2.1 Problem Statement
+
+**Core Challenge:** Match 500K pending workloads to 30K available nodes efficiently in a 100K node compute marketplace.
+
+**Key Constraints:**
+- **Matching pool**: 30K available nodes (65K busy, 5K offline)
+- **Workload throughput**: 5.56 workloads/sec = 20K/hour
+- **Fairness requirement**: Oldest workloads must be prioritized
+- **Resource efficiency**: Idle nodes should not remain unused while workloads wait
+
+### 2.2 Design Goals
+
+1. **Minimize query count**: Avoid per-workload queries (5.6 queries/sec), use batch approach
+2. **Avoid ORDER BY where possible**: Use filters with price ceilings instead of sorting large result sets
+3. **Maximize resource utilization**: Continue matching from younger age buckets while nodes available
+4. **Query performance**: Keep individual queries fast with LIMIT constraints
+5. **Fair queuing**: Process workloads by age priority (oldest first)
+
+### 2.3 Resource-Driven Age-Based Bucket Strategy
+
+**Approach:** Organize the pending workloads into 10 age buckets (2-hour increments), process oldest first, continue through younger buckets while nodes remain available.
+
+**Age Buckets:**
+- Bucket 0: 0-2 hours (newest)
+- Bucket 1: 2-4 hours
+- Bucket 2: 4-6 hours
+- ...
+- Bucket 9: 24+ hours (oldest, highest priority)
+
+**Matching Algorithm (Every 10-second cycle):**
+
+1. **Process buckets oldest-first**:
+   - **Step 1: Fetch workload batch** from bucket 9 (24h+), LIMIT 100
+   - **Step 2: Analyze workload constraints** from batch:
+     - Unique regions needed (e.g., us-east, eu-west)
+     - Unique vm_types needed (e.g., gpu, cpu-only)
+     - Resource ranges (min/max CPU, RAM, GPU)
+     - Price ceiling (max budget across batch)
+   - **Step 3: Fetch matching nodes** using aggregated constraints, eg LIMIT 150:
+     - Filter by regions IN (discovered regions)
+     - Filter by vm_types IN (discovered types)
+     - Filter by cpu_cores >= min_needed, ram_gb >= min_needed
+     - Filter by price_per_hour <= max_budget
+     - Result: Fetch only nodes that could match this batch (~1K-5K nodes)
+   - **Step 4: Match in-memory**: Pair workloads to nodes
+   - **Step 5: Update Entities** Batch update matched workloads/nodes
+   - **Step 6: try to exhaust current workload bucket**: Go back to Step 1 as long as there are unmatched workloads and available nodes.
+2. **Move to next bucket**: While not working on youngest bucket
+
+**Key Features:**
+- **Age-based priority**: Always starts with oldest bucket
+- **Data-driven node queries**: Only fetch nodes matching current workload batch requirements
+- **Per-query limits**: 100 workloads per query, only relevant nodes fetched
+- **Unlimited matches per cycle**: Can match hundreds/thousands of workloads if nodes available
+- **Fair queuing**: Older workloads never starve
+
+### 2.4 Query Estimates
+
+**Per Cycle (10 seconds):**
+
+- Matches per cycle: 0-60K
+- Workloads per query: 100, fixed LIMIT for consistent performance
+- Nodes per query: 150, limit at 1.5x workload limit
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| **Workload queries** | 1-100 per cycle | One per batch; Step 6 loops exhaust buckets before moving on |
+| **Node queries** | 1-100 per cycle | One per workload batch (paired with workload query) |
+| **Total queries** | 2-200 per cycle | Workload + Node query pairs |
+| **Average query rate** | 0.2-20 queries/sec | 2-200 queries / 10-second cycle |
+
+**Total Read Operations:**
+
+| Query Type | Frequency (per sec) | Purpose |
+|------------|---------------------|---------|
+| **Matching strategy** | 0.2-20 | Age-bucket workload queries and node queries |
+| **Point lookups** | 40-100 | Node/workload details by ID (API endpoints, monitoring) |
+| **Health monitoring** | 20 | Node status checks |
+| **Tenant accounting** | 40 | Quota checks, billing |
+| **Dashboard/reporting** | 20-60 | UI queries, analytics (cached, periodic refresh) |
+| **Total steady-state** | **~120-240 queries/sec** | Normal operations |
+
+**Peak Scenarios:**
+- **Scheduler burst**: 10x matching rate = **200 queries/sec** (matching queries)
+- **Monitoring sweep**: **1,500 queries/sec** (periodic health checks across fleet)
+- **Design target**: **1,500 queries/sec sustained** | Realistic with headroom
+
+### 2.5 Combined Read/Write Load
+
+| Scenario | Write (entities/sec) | Read (queries/sec) | Notes |
+|----------|---------------------|-------------------|-------|
+| **Steady-state** | 170-235 | 120-240 | Balanced marketplace, conditional updates |
+| **Resource usage spike** | 1,050-1,070 | 120-240 | Many workloads change usage simultaneously |
+| **Batch submission** | 255-270 | 200 | Block rate limited (2-sec blocks) |
+| **Node failure** | 415-465 | 200 | Decentralized: correlated failures rare |
+| **Mass job completion** | 355-370 | 200 | Large batch finishes |
+| **Design target** | **1,600 peak** | **1,500 sustained** | Realistic with headroom |
+
+## 4. Performance Framework Summary
+
+### Write Requirements
+
+| Metric | Target | Peak | Notes |
+|--------|--------|------|-------|
+| **Sustained writes** | 1,000 entities/sec | 10,000 entities/sec | Handles steady-state + bursts |
+| **Transaction size** | 1,000-5,000 entities | — | Batch for efficiency |
+| **Commit latency** | <100ms | <500ms | p99 target |
+| **Write availability** | 99.9% | — | Single writer, WAL mode |
+
+### Read Requirements
+
+| Metric | Target | Peak | Notes |
+|--------|--------|------|-------|
+| **Sustained reads** | 1,000 queries/sec | 2,500 queries/sec | Scheduler + monitoring |
+| **Query latency (p50)** | <10ms | — | Point lookups, indexed filters |
+| **Query latency (p99)** | <100ms | <500ms | Complex multi-constraint filters |
+| **Result set size** | 10-100 rows | 1,000 rows max | Application-side final selection |
+| **Read availability** | 99.99% | — | WAL allows concurrent reads |
+
+### Capacity Validation
+
+| Metric | 300K Node Marketplace | Mendoza Benchmark | Ratio | Status |
+|--------|----------------------|-------------------|-------|--------|
+| **Entities** | 663K | 800K | 0.83x | ✅ Within capacity |
+| **Attributes** | 15.3M | 19.4M | 0.79x | ✅ Within capacity |
+| **Write throughput** | 250 entities/sec | ~700 entities/sec | 0.36x | ✅ Comfortable margin |
+| **Write peak** | 1.6K entities/sec | Unknown | ~2.3x | ⚠️ Needs benchmarking |
+| **Read throughput** | 1.5K queries/sec | — | — | ⚠️ Needs benchmarking |
+| **Read peak** | 1.5K queries/sec | — | — | ⚠️ Needs benchmarking |
+
+**Confidence Level:**
+- ✅ **Entity/attribute scale**: High confidence (within Mendoza proven capacity)
+- ⚠️ **Write throughput**: Medium confidence (1.4x Mendoza, needs batching validation)
+- ⚠️ **Write peak**: Low confidence (14x Mendoza, needs stress testing)
+- ✅ **Read throughput**: High confidence (SQLite excels at reads with proper indexes)
+
+## 5. Next Steps for Validation
+
+1. **Benchmark batch writes**: Test 1K-10K entities/sec with realistic transaction sizes (1K-5K entities/tx)
+2. **Index optimization**: Validate composite indexes for common query patterns
+3. **Peak load simulation**: Stress test with resource metric windows (8K entities/sec for 30 sec bursts)
+4. **Query plan analysis**: EXPLAIN QUERY PLAN for all common query types
+5. **Concurrent read testing**: Validate 2.5K queries/sec with WAL mode
 
 ---
 

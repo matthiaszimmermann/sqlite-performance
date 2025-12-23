@@ -1354,7 +1354,7 @@ The experiments succeed if we can answer:
 | Max reads at 10x? | QPS, latency p99 |
 | Combined sweet spot? | X writes/sec + Y reads/sec |
 | Degradation curve? | Performance vs DB size chart |
-| V1 feasibility? | Go/no-go for Data Center (621K entities, 10K-50K writes/sec, 1K-10K reads/sec) |
+| V1 feasibility? | Go/no-go for Compute Marketplace (663K entities, 170-235 writes/sec steady, 120-240 reads/sec) |
 
 ### Potential Optimizations to Test
 

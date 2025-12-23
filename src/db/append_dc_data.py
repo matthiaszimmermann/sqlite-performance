@@ -122,11 +122,17 @@ def get_vm_type_distribution() -> list[tuple[str, float]]:
 
 
 def get_node_status_distribution() -> list[tuple[str, float]]:
-    """Node status distribution: (value, cumulative_probability)."""
+    """Node status distribution: (value, cumulative_probability).
+    
+    Realistic high-utilization data center:
+    - 65% busy (running workloads)
+    - 30% available (ready for assignment)
+    - 5% offline (maintenance, failures)
+    """
     return [
-        ("available", 0.70),
-        ("busy", 0.95),      # 0.70 + 0.25
-        ("offline", 1.00),   # 0.95 + 0.05
+        ("busy", 0.65),
+        ("available", 0.95),  # 0.65 + 0.30
+        ("offline", 1.00),    # 0.95 + 0.05
     ]
 
 
