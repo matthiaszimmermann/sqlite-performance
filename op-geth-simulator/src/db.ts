@@ -539,13 +539,12 @@ function buildSqlFromArkivQuery(
   
   // If no conditions, return simple query
   if (conditions.length === 0) {
-    const sqlQuery = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM payloads AS e LEFT JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' LEFT JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE $1 BETWEEN e.from_block AND e.to_block - 1 ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
+    const sqlQuery = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM payloads AS e LEFT JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' LEFT JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE ? BETWEEN e.from_block AND e.to_block - 1 ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
     return { sqlQuery, params: [currentBlock] }
   }
 
   const ctes: string[] = []
   const params: (string | number)[] = []
-  let paramIndex = 1
 
   // Step 1: Build CTEs for each condition (table_1, table_2, table_4, table_6, table_8, table_10, ...)
   // Note: table numbers skip for intersect tables, but we'll number them sequentially first
@@ -557,16 +556,15 @@ function buildSqlFromArkivQuery(
     const valueOperator = cond.isNumeric ? cond.operator : "="
     
     // Build CTE: SELECT entity_key, from_block from attributes joined with payloads
-    const cte = `${tableName} AS (SELECT e.entity_key, e.from_block FROM ${attrTable} AS a INNER JOIN payloads AS e ON a.entity_key = e.entity_key AND a.from_block = e.from_block AND $${paramIndex + 2} BETWEEN e.from_block AND e.to_block - 1 WHERE key = $${paramIndex} AND value ${valueOperator} $${paramIndex + 1})`
+    // Use ? for parameters: currentBlock, key, value (matching SQL order)
+    const cte = `${tableName} AS (SELECT e.entity_key, e.from_block FROM ${attrTable} AS a INNER JOIN payloads AS e ON a.entity_key = e.entity_key AND a.from_block = e.from_block AND ? BETWEEN e.from_block AND e.to_block - 1 WHERE key = ? AND value ${valueOperator} ?)`
     
     ctes.push(cte)
     
-    // Parameters: key, value, currentBlock
+    // Parameters: currentBlock, key, value (matching SQL placeholder order)
+    params.push(currentBlock)
     params.push(cond.key)
     params.push(cond.value as string | number)
-    params.push(currentBlock)
-    
-    paramIndex += 3
   }
 
   // Step 2: Build INTERSECT chain
@@ -593,7 +591,7 @@ function buildSqlFromArkivQuery(
 
   // Step 3: Build final SELECT
   const finalTable = conditions.length === 1 ? "table_1" : `table_${nextIntersectTableNum - 1}`
-  const finalSelect = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM ${finalTable} AS keys INNER JOIN payloads AS e ON keys.entity_key = e.entity_key AND keys.from_block = e.from_block INNER JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' INNER JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE $${paramIndex} BETWEEN e.from_block AND e.to_block ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
+  const finalSelect = `SELECT e.content_type AS content_type, e.entity_key AS entity_key, expirationAttrs.Value AS expires_at, e.from_block AS from_block, e.numeric_attributes AS numeric_attributes, ownerAttrs.Value AS owner, e.payload AS payload, e.string_attributes AS string_attributes FROM ${finalTable} AS keys INNER JOIN payloads AS e ON keys.entity_key = e.entity_key AND keys.from_block = e.from_block INNER JOIN string_attributes AS ownerAttrs ON e.entity_key = ownerAttrs.entity_key AND e.from_block = ownerAttrs.from_block AND ownerAttrs.key = '$owner' INNER JOIN numeric_attributes AS expirationAttrs ON e.entity_key = expirationAttrs.entity_key AND e.from_block = expirationAttrs.from_block AND expirationAttrs.key = '$expiration' WHERE ? BETWEEN e.from_block AND e.to_block ORDER BY from_block, entity_key LIMIT ${limit}${offset > 0 ? ` OFFSET ${offset}` : ""}`
   
   params.push(currentBlock)
   
@@ -629,22 +627,16 @@ async function executeArkivQuery(
       // Reuse cached SQL query structure (with placeholders)
       console.log("cached.sqlQuery hit!!!", cached.sqlQuery)
       sqlQuery = cached.sqlQuery
-      
-      // Build fresh parameters from the actual query values
-      // The SQL structure is the same, but values may differ
-      const { params: freshParams } = buildSqlFromArkivQuery(arkivQuery, currentBlock, limit, offset)
-      params = freshParams
+      params = cached.params
     } else {
       // Build SQL query from Arkiv query (first time for this structure)
       const result = buildSqlFromArkivQuery(arkivQuery, currentBlock, limit, offset)
       sqlQuery = result.sqlQuery
       params = result.params
 
-      // Cache only the SQL query structure (with placeholders)
-      // Don't cache parameters since they change with each query
       queryCache.set(cacheKey, {
         sqlQuery,
-        params: [], // Empty - params are built fresh each time
+        params,
       })
     }
   } else {
@@ -659,7 +651,7 @@ async function executeArkivQuery(
   console.log("params", params)
   const stmt = database.prepare(sqlQuery)
   const rows = stmt.all(...params) as Array<Record<string, unknown>>
-
+  
   return rows
 }
 
