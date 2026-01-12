@@ -61,44 +61,60 @@ func generateNewEntityKey() []byte {
 	return key
 }
 
-// getAvailableBlocks gets all available block numbers from source database
-func getAvailableBlocks(sourceDb *sql.DB) ([]int64, error) {
+// getAvailableBlocks gets all available entity keys from source database
+// Since the new schema doesn't have from_block, we'll group by entity_key
+func getAvailableEntityKeys(sourceDb *sql.DB) ([][]byte, error) {
 	query := `
-		SELECT from_block 
+		SELECT DISTINCT entity_key 
 		FROM payloads 
-		GROUP BY from_block
-		HAVING COUNT(*) < 1500
-		ORDER BY from_block
+		ORDER BY entity_key
+		LIMIT 10000
 	`
 	rows, err := sourceDb.Query(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query available blocks: %w", err)
+		return nil, fmt.Errorf("failed to query available entity keys: %w", err)
 	}
 	defer rows.Close()
 
-	var blocks []int64
+	var keys [][]byte
 	for rows.Next() {
-		var block int64
-		if err := rows.Scan(&block); err != nil {
-			return nil, fmt.Errorf("failed to scan block: %w", err)
+		var key []byte
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("failed to scan entity key: %w", err)
 		}
-		blocks = append(blocks, block)
+		keys = append(keys, key)
 	}
-	return blocks, rows.Err()
+	return keys, rows.Err()
 }
 
-// readBlockData reads all payloads for a specific block from source database
-func readBlockData(sourceDb *sql.DB, fromBlock int64) (*BlockData, error) {
+// readEntityData reads data for specific entity keys from source database
+func readEntityData(sourceDb *sql.DB, entityKeys [][]byte) (*BlockData, error) {
 	blockData := &BlockData{}
 
-	// Read payloads for the given block
-	payloadsQuery := `
+	// Read payloads for the given entity keys
+	// Use IN clause or prepare statement for multiple keys
+	if len(entityKeys) == 0 {
+		return blockData, nil
+	}
+
+	// Build query with placeholders
+	placeholders := ""
+	args := make([]interface{}, len(entityKeys))
+	for i, key := range entityKeys {
+		if i > 0 {
+			placeholders += ","
+		}
+		placeholders += "?"
+		args[i] = key
+	}
+
+	payloadsQuery := fmt.Sprintf(`
 		SELECT entity_key, payload, content_type, string_attributes, numeric_attributes
 		FROM payloads
-		WHERE from_block = ?
-	`
+		WHERE entity_key IN (%s)
+	`, placeholders)
 
-	rows, err := sourceDb.Query(payloadsQuery, fromBlock)
+	rows, err := sourceDb.Query(payloadsQuery, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query payloads: %w", err)
 	}
@@ -139,40 +155,50 @@ func createEntityKeyMap(blockData *BlockData) map[string][]byte {
 	return keyMap
 }
 
-// loadBlockPool loads a pool of random blocks into memory
+// loadBlockPool loads a pool of random entity groups into memory
+// Each "block" in the pool is a group of entities (simulating a block)
 func loadBlockPool(sourceDb *sql.DB) error {
-	fmt.Println("Loading block pool into memory...")
-	availableBlocks, err := getAvailableBlocks(sourceDb)
+	fmt.Println("Loading entity pool into memory...")
+	availableEntityKeys, err := getAvailableEntityKeys(sourceDb)
 	if err != nil {
-		return fmt.Errorf("failed to get available blocks: %w", err)
+		return fmt.Errorf("failed to get available entity keys: %w", err)
 	}
 
-	fmt.Printf("Found %d blocks in source database\n", len(availableBlocks))
+	fmt.Printf("Found %d entity keys in source database\n", len(availableEntityKeys))
 
-	if len(availableBlocks) == 0 {
-		return fmt.Errorf("no blocks found in source database")
+	if len(availableEntityKeys) == 0 {
+		return fmt.Errorf("no entities found in source database")
 	}
 
-	// Randomly select blockPoolSize blocks (or all if less available)
-	blocksToLoad := blockPoolSize
-	if len(availableBlocks) < blockPoolSize {
-		blocksToLoad = len(availableBlocks)
+	// Randomly select entity keys to form blocks
+	// Each "block" will contain a random group of entities
+	entitiesPerBlock := 100 // Approximate entities per block
+	totalEntitiesToLoad := blockPoolSize * entitiesPerBlock
+	if len(availableEntityKeys) < totalEntitiesToLoad {
+		totalEntitiesToLoad = len(availableEntityKeys)
 	}
 
-	// Shuffle and take first blocksToLoad
-	rand.Shuffle(len(availableBlocks), func(i, j int) {
-		availableBlocks[i], availableBlocks[j] = availableBlocks[j], availableBlocks[i]
+	// Shuffle entity keys
+	rand.Shuffle(len(availableEntityKeys), func(i, j int) {
+		availableEntityKeys[i], availableEntityKeys[j] = availableEntityKeys[j], availableEntityKeys[i]
 	})
-	selectedBlocks := availableBlocks[:blocksToLoad]
+	selectedEntityKeys := availableEntityKeys[:totalEntitiesToLoad]
 
-	fmt.Printf("Loading %d blocks into memory...\n", blocksToLoad)
+	fmt.Printf("Loading %d entities into memory (forming ~%d blocks)...\n", totalEntitiesToLoad, blockPoolSize)
 	loadStartTime := time.Now()
 
-	blockPool = make([]BlockData, 0, blocksToLoad)
-	for _, blockNumber := range selectedBlocks {
-		blockData, err := readBlockData(sourceDb, blockNumber)
+	// Group entities into blocks
+	blockPool = make([]BlockData, 0, blockPoolSize)
+	for i := 0; i < len(selectedEntityKeys); i += entitiesPerBlock {
+		end := i + entitiesPerBlock
+		if end > len(selectedEntityKeys) {
+			end = len(selectedEntityKeys)
+		}
+
+		entityKeysForBlock := selectedEntityKeys[i:end]
+		blockData, err := readEntityData(sourceDb, entityKeysForBlock)
 		if err != nil {
-			return fmt.Errorf("failed to read block %d: %w", blockNumber, err)
+			return fmt.Errorf("failed to read entities: %w", err)
 		}
 
 		if len(blockData.Payloads) > 0 {
@@ -357,48 +383,54 @@ func getOutputDbSize(targetDbPath string) int64 {
 	return info.Size()
 }
 
-// replicateRandomBlock processes a single random block from the pool
-func replicateRandomBlock(targetBlockNumber int64) (int, int, int, float64, error) {
+// processBatch processes a batch of blocks
+func processBatch(batchSize int, targetBlockNumber int64) (int, int, int, float64, error) {
 	if len(blockPool) == 0 {
 		return 0, 0, 0, 0, fmt.Errorf("block pool is empty")
 	}
 
-	blockStartTime := time.Now()
+	batchStartTime := time.Now()
 
-	// Select a random block from the pool
-	randomIndex := rand.Intn(len(blockPool))
-	blockData := blockPool[randomIndex]
+	// Select random blocks from the pool to replicate
+	blocksToReplicate := make([]BlockData, 0, batchSize)
+	for i := 0; i < batchSize && i < len(blockPool); i++ {
+		randomIndex := rand.Intn(len(blockPool))
+		blocksToReplicate = append(blocksToReplicate, blockPool[randomIndex])
+	}
 
 	// Calculate totals for logging
-	blockPayloads := len(blockData.Payloads)
-	blockStringAttrs := 0
-	blockNumericAttrs := 0
+	batchPayloads := 0
+	batchStringAttrs := 0
+	batchNumericAttrs := 0
 
-	// Count attributes from JSON in payloads
-	for _, payload := range blockData.Payloads {
-		if payload.StringAttributes != "" {
-			var strAttrs map[string]interface{}
-			if err := json.Unmarshal([]byte(payload.StringAttributes), &strAttrs); err == nil {
-				blockStringAttrs += len(strAttrs)
+	for _, blockData := range blocksToReplicate {
+		batchPayloads += len(blockData.Payloads)
+
+		// Count attributes from JSON in payloads
+		for _, payload := range blockData.Payloads {
+			if payload.StringAttributes != "" {
+				var strAttrs map[string]interface{}
+				if err := json.Unmarshal([]byte(payload.StringAttributes), &strAttrs); err == nil {
+					batchStringAttrs += len(strAttrs)
+				}
 			}
-		}
-		if payload.NumericAttributes != "" {
-			var numAttrs map[string]interface{}
-			if err := json.Unmarshal([]byte(payload.NumericAttributes), &numAttrs); err == nil {
-				blockNumericAttrs += len(numAttrs)
+			if payload.NumericAttributes != "" {
+				var numAttrs map[string]interface{}
+				if err := json.Unmarshal([]byte(payload.NumericAttributes), &numAttrs); err == nil {
+					batchNumericAttrs += len(numAttrs)
+				}
 			}
 		}
 	}
 
-	// Write the block (single block in a batch)
-	blocksToReplicate := []BlockData{blockData}
+	// Write the batch
 	if err := writeReplicatedBlockBatch(blocksToReplicate, targetBlockNumber); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("failed to write block: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("failed to write batch: %w", err)
 	}
 
-	blockDuration := time.Since(blockStartTime)
+	batchDuration := time.Since(batchStartTime)
 
-	return blockPayloads, blockStringAttrs, blockNumericAttrs, float64(blockDuration.Nanoseconds()) / 1e6, nil
+	return batchPayloads, batchStringAttrs, batchNumericAttrs, float64(batchDuration.Nanoseconds()) / 1e6, nil
 }
 
 // printFinalStatistics prints final replication statistics
@@ -511,38 +543,44 @@ func RunBlockReplicator(sourceDbPath, targetDbPath string, numBlocks int) error 
 		return fmt.Errorf("failed to initialize CSV log: %w", err)
 	}
 
-	fmt.Printf("Starting block replicator (target: %d blocks)...\n", numBlocks)
+	fmt.Printf("Starting block replicator (processing batches of %d blocks, target: %d blocks)...\n", batchSize, numBlocks)
 
 	startTime := time.Now()
 	targetBlockNumber := int64(1)
 
-	// Continuously process random blocks until we reach the target number of blocks
+	// Continuously process batches until we reach the target number of blocks
 	for totalBlocksReplicated < numBlocks {
-		// Process a single random block
-		blockPayloads, blockStringAttrs, blockNumericAttrs, blockDuration, err := replicateRandomBlock(targetBlockNumber)
-		if err != nil {
-			return fmt.Errorf("failed to process block: %w", err)
+		remaining := numBlocks - totalBlocksReplicated
+		currentBatchSize := batchSize
+		if remaining < batchSize {
+			currentBatchSize = remaining
 		}
 
-		totalBlocksReplicated++
-		totalPayloads += blockPayloads
-		totalStringAttrs += blockStringAttrs
-		totalNumericAttrs += blockNumericAttrs
+		// Process batch
+		batchPayloads, batchStringAttrs, batchNumericAttrs, batchDuration, err := processBatch(currentBatchSize, targetBlockNumber)
+		if err != nil {
+			return fmt.Errorf("failed to process batch: %w", err)
+		}
+
+		totalBlocksReplicated += currentBatchSize
+		totalPayloads += batchPayloads
+		totalStringAttrs += batchStringAttrs
+		totalNumericAttrs += batchNumericAttrs
 		targetBlockNumber++
 
 		// Write CSV log entry
 		outputDbSize := getOutputDbSize(targetDbPath)
-		if err := writeCsvRow(blockPayloads, blockStringAttrs, blockNumericAttrs, 0, blockDuration, outputDbSize); err != nil {
+		if err := writeCsvRow(batchPayloads, batchStringAttrs, batchNumericAttrs, 0, batchDuration, outputDbSize); err != nil {
 			fmt.Printf("Warning: Failed to write CSV row: %v\n", err)
 		}
 
-		message := fmt.Sprintf("[BLOCK] Processed block %d: %d payloads, %d str attrs, %d num attrs - %.2fms",
-			targetBlockNumber-1, blockPayloads, blockStringAttrs, blockNumericAttrs, blockDuration)
+		message := fmt.Sprintf("[BATCH] Processed %d blocks: %d payloads, %d str attrs, %d num attrs - %.2fms",
+			currentBatchSize, batchPayloads, batchStringAttrs, batchNumericAttrs, batchDuration)
 		fmt.Println(message)
 
-		// Warn if block processing takes more than 1000ms
-		if blockDuration > 1000 {
-			fmt.Printf("⚠️  WARNING: Block processing took %.2fms\n", blockDuration)
+		// Warn if batch processing takes more than 1000ms
+		if batchDuration > 1000 {
+			fmt.Printf("⚠️  WARNING: Batch processing took %.2fms\n", batchDuration)
 		}
 	}
 
