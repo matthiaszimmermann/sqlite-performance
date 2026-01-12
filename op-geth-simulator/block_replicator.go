@@ -267,23 +267,49 @@ func writeReplicatedBlockBatch(blocksData []BlockData, targetBlockNumber int64) 
 			}
 
 			// Parse string and numeric attributes from JSON
-			var stringAttrs map[string]string
-			var numericAttrs map[string]float64
+			// The structure is: {"Values": {"key1": "value1", "key2": "value2"}}
+			type AttributesWrapper struct {
+				Values map[string]interface{} `json:"Values"`
+			}
+
+			var stringAttrs map[string]string = make(map[string]string)
+			var numericAttrs map[string]float64 = make(map[string]float64)
 
 			if payload.StringAttributes != "" {
-				if err := json.Unmarshal([]byte(payload.StringAttributes), &stringAttrs); err != nil {
-					stringAttrs = make(map[string]string)
+				var wrapper AttributesWrapper
+				if err := json.Unmarshal([]byte(payload.StringAttributes), &wrapper); err == nil {
+					if wrapper.Values != nil {
+						for k, v := range wrapper.Values {
+							if strVal, ok := v.(string); ok {
+								stringAttrs[k] = strVal
+							}
+						}
+					}
 				}
-			} else {
-				stringAttrs = make(map[string]string)
 			}
 
 			if payload.NumericAttributes != "" {
-				if err := json.Unmarshal([]byte(payload.NumericAttributes), &numericAttrs); err != nil {
-					numericAttrs = make(map[string]float64)
+				var wrapper AttributesWrapper
+				if err := json.Unmarshal([]byte(payload.NumericAttributes), &wrapper); err == nil {
+					if wrapper.Values != nil {
+						for k, v := range wrapper.Values {
+							// Try to convert to float64
+							switch val := v.(type) {
+							case float64:
+								numericAttrs[k] = val
+							case int:
+								numericAttrs[k] = float64(val)
+							case int64:
+								numericAttrs[k] = float64(val)
+							case string:
+								// Try to parse as number
+								if numVal, err := strconv.ParseFloat(val, 64); err == nil {
+									numericAttrs[k] = numVal
+								}
+							}
+						}
+					}
 				}
-			} else {
-				numericAttrs = make(map[string]float64)
 			}
 
 			// Convert numeric attributes to uint64
@@ -407,17 +433,26 @@ func processBatch(batchSize int, targetBlockNumber int64) (int, int, int, float6
 		batchPayloads += len(blockData.Payloads)
 
 		// Count attributes from JSON in payloads
+		// The structure is: {"Values": {"key1": "value1", "key2": "value2"}}
+		type AttributesWrapper struct {
+			Values map[string]interface{} `json:"Values"`
+		}
+
 		for _, payload := range blockData.Payloads {
 			if payload.StringAttributes != "" {
-				var strAttrs map[string]interface{}
-				if err := json.Unmarshal([]byte(payload.StringAttributes), &strAttrs); err == nil {
-					batchStringAttrs += len(strAttrs)
+				var wrapper AttributesWrapper
+				if err := json.Unmarshal([]byte(payload.StringAttributes), &wrapper); err == nil {
+					if wrapper.Values != nil {
+						batchStringAttrs += len(wrapper.Values)
+					}
 				}
 			}
 			if payload.NumericAttributes != "" {
-				var numAttrs map[string]interface{}
-				if err := json.Unmarshal([]byte(payload.NumericAttributes), &numAttrs); err == nil {
-					batchNumericAttrs += len(numAttrs)
+				var wrapper AttributesWrapper
+				if err := json.Unmarshal([]byte(payload.NumericAttributes), &wrapper); err == nil {
+					if wrapper.Values != nil {
+						batchNumericAttrs += len(wrapper.Values)
+					}
 				}
 			}
 		}
