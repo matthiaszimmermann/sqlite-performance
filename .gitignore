@@ -43,6 +43,7 @@ htmlcov/
 
 # SQLite
 *.db
+*.db*
 *.sqlite
 *.sqlite3
 
