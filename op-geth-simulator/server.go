@@ -62,6 +62,10 @@ func StartServer(port int, dbPath string, testname string) error {
 func requestLoggerMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
+		timestamp := time.Now().Format(time.RFC3339)
+
+		// Log incoming request with debug level
+		fmt.Printf("[%s] [DEBUG] [HTTP] Incoming request: %s %s\n", timestamp, r.Method, r.URL.Path)
 
 		// Create a response writer wrapper to capture status code
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
@@ -69,7 +73,6 @@ func requestLoggerMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 
 		duration := time.Since(startTime)
-		timestamp := time.Now().Format(time.RFC3339)
 		statusCode := rw.statusCode
 		durationMs := duration.Milliseconds()
 
@@ -81,8 +84,9 @@ func requestLoggerMiddleware(next http.Handler) http.Handler {
 			level = "WARN"
 		}
 
-		fmt.Printf("[%s] [%s] %s %s - %d - %dms\n",
-			timestamp,
+		// Log request completion
+		fmt.Printf("[%s] [%s] [HTTP] %s %s - %d - %dms\n",
+			time.Now().Format(time.RFC3339),
 			level,
 			r.Method,
 			r.URL.Path,
@@ -110,40 +114,68 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // healthHandler handles health check requests
 func healthHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	queueSize := writeQueue.GetQueueSize()
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /health - Queue size: %d\n", timestamp, queueSize)
+
 	response := map[string]interface{}{
 		"status":    "ok",
-		"queueSize": writeQueue.GetQueueSize(),
+		"queueSize": queueSize,
 	}
 	jsonResponse(w, http.StatusOK, response)
 }
 
 // writeEntityHandler handles entity write requests
 func writeEntityHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	queueSizeBefore := writeQueue.GetQueueSize()
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Queue size before: %d\n", timestamp, queueSizeBefore)
+
 	var request EntityWriteRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Invalid JSON: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
 
+	// Log request details
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Key: %s, ContentType: %s, OwnerAddress: %s, ExpiresIn: %d, PayloadSize: %d\n",
+		timestamp, request.Key, request.ContentType, request.OwnerAddress, request.ExpiresIn, len(request.Payload))
+
+	if len(request.StringAnnotations) > 0 {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - String annotations: %v\n", timestamp, request.StringAnnotations)
+	}
+	if len(request.NumericAnnotations) > 0 {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Numeric annotations: %v\n", timestamp, request.NumericAnnotations)
+	}
+
 	// Validate required fields
 	if request.Key == "" || request.ContentType == "" || request.OwnerAddress == "" {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Missing required fields\n", time.Now().Format(time.RFC3339))
 		jsonError(w, http.StatusBadRequest, "Missing required fields: key, contentType, ownerAddress")
 		return
 	}
 
 	if request.ExpiresIn <= 0 {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Invalid ExpiresIn: %d\n", time.Now().Format(time.RFC3339), request.ExpiresIn)
 		jsonError(w, http.StatusBadRequest, "expiresIn must be a positive number")
 		return
 	}
 
 	// Enqueue the entity
 	id := writeQueue.Enqueue(&request)
+	queueSizeAfter := writeQueue.GetQueueSize()
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Entity enqueued with ID: %s, Queue size after: %d (delta: %d)\n",
+		time.Now().Format(time.RFC3339), id, queueSizeAfter, queueSizeAfter-queueSizeBefore)
 
 	response := map[string]interface{}{
 		"success":   true,
 		"id":        id,
 		"message":   "Entity queued for processing",
-		"queueSize": writeQueue.GetQueueSize(),
+		"queueSize": queueSizeAfter,
 	}
 
 	jsonResponse(w, http.StatusAccepted, response)
@@ -151,24 +183,33 @@ func writeEntityHandler(w http.ResponseWriter, r *http.Request) {
 
 // getEntityHandler handles get entity by key requests
 func getEntityHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
 	vars := mux.Vars(r)
 	key := vars["key"]
 
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/{key} - Key: %s\n", timestamp, key)
+
 	if key == "" {
+		fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/{key} - Missing key parameter\n", time.Now().Format(time.RFC3339))
 		jsonError(w, http.StatusBadRequest, "Key parameter is required")
 		return
 	}
 
 	entity, err := GetEntityByKey(key)
 	if err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/{key} - Error: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
 
 	if entity == nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/{key} - Entity not found\n", time.Now().Format(time.RFC3339))
 		jsonError(w, http.StatusNotFound, "Entity not found")
 		return
 	}
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/{key} - Entity found: ContentType=%s, PayloadSize=%d, StringAttrs=%d, NumericAttrs=%d\n",
+		time.Now().Format(time.RFC3339), entity.ContentType, len(entity.Payload), len(entity.StringAnnotations), len(entity.NumericAnnotations))
 
 	// Convert payload to base64 string
 	response := entityToResponse(entity)
@@ -177,8 +218,12 @@ func getEntityHandler(w http.ResponseWriter, r *http.Request) {
 
 // queryEntitiesHandler handles query entity requests
 func queryEntitiesHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities/query\n", timestamp)
+
 	var request EntityQueryRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities/query - Invalid JSON: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusBadRequest, "Invalid JSON")
 		return
 	}
@@ -188,6 +233,9 @@ func queryEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities/query - OwnerAddress=%s, Limit=%d, Offset=%d, StringAttrs=%d, NumericAttrs=%d\n",
+		timestamp, request.OwnerAddress, limit, request.Offset, len(request.StringAnnotations), len(request.NumericAnnotations))
+
 	entities, err := QueryEntities(
 		request.OwnerAddress,
 		request.StringAnnotations,
@@ -196,9 +244,12 @@ func queryEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 		request.Offset,
 	)
 	if err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities/query - Error: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities/query - Found %d entities\n", time.Now().Format(time.RFC3339), len(entities))
 
 	// Convert entities to response format
 	responseEntities := make([]map[string]interface{}, len(entities))
@@ -216,11 +267,17 @@ func queryEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 
 // countEntitiesHandler handles count entities requests
 func countEntitiesHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/count\n", timestamp)
+
 	count, err := CountEntities()
 	if err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/count - Error: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /entities/count - Count: %d\n", time.Now().Format(time.RFC3339), count)
 
 	response := map[string]interface{}{
 		"count": count,
@@ -231,10 +288,16 @@ func countEntitiesHandler(w http.ResponseWriter, r *http.Request) {
 
 // cleanAllDataHandler handles clean all data requests
 func cleanAllDataHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Printf("[%s] [DEBUG] [HTTP] DELETE /entities/clean\n", timestamp)
+
 	if err := CleanAllData(); err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] DELETE /entities/clean - Error: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusInternalServerError, "Internal server error")
 		return
 	}
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] DELETE /entities/clean - Success\n", time.Now().Format(time.RFC3339))
 
 	response := map[string]interface{}{
 		"success": true,
@@ -246,16 +309,21 @@ func cleanAllDataHandler(w http.ResponseWriter, r *http.Request) {
 
 // getReceiptHandler handles get receipt requests
 func getReceiptHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
 	vars := mux.Vars(r)
 	id := vars["id"]
 
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /receipt/{id} - ID: %s\n", timestamp, id)
+
 	if id == "" {
+		fmt.Printf("[%s] [DEBUG] [HTTP] GET /receipt/{id} - Missing ID parameter\n", time.Now().Format(time.RFC3339))
 		jsonError(w, http.StatusBadRequest, "ID parameter is required")
 		return
 	}
 
 	// Note: Receipt functionality would need to be implemented in the store
 	// For now, return a placeholder response
+	fmt.Printf("[%s] [DEBUG] [HTTP] GET /receipt/{id} - Not implemented\n", time.Now().Format(time.RFC3339))
 	jsonError(w, http.StatusNotImplemented, "Receipt functionality not yet implemented")
 }
 

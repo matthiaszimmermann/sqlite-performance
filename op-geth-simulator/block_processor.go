@@ -61,14 +61,20 @@ func StartBlockProcessor(testname string) {
 	// Start FollowEvents in a separate goroutine - it will run continuously
 	// and process batches as they're pushed to the iterator
 	go func() {
-		fmt.Println("[FOLLOW] Starting FollowEvents goroutine...")
+		timestamp := time.Now().Format(time.RFC3339)
+		fmt.Printf("[%s] [DEBUG] [BLOCK] Starting FollowEvents goroutine...\n", timestamp)
 		batchIterator := pushIterator.Iterator()
 		if err := FollowEvents(followEventsCtx, arkivevents.BatchIterator(batchIterator)); err != nil {
 			if err != context.Canceled {
-				fmt.Printf("[FOLLOW] FollowEvents error: %v\n", err)
+				timestamp := time.Now().Format(time.RFC3339)
+				fmt.Printf("[%s] [ERROR] [BLOCK] FollowEvents error: %v\n", timestamp, err)
 			} else {
-				fmt.Println("[FOLLOW] FollowEvents stopped (context canceled)")
+				timestamp := time.Now().Format(time.RFC3339)
+				fmt.Printf("[%s] [DEBUG] [BLOCK] FollowEvents stopped (context canceled)\n", timestamp)
 			}
+		} else {
+			timestamp := time.Now().Format(time.RFC3339)
+			fmt.Printf("[%s] [DEBUG] [BLOCK] FollowEvents exited normally\n", timestamp)
 		}
 	}()
 
@@ -79,14 +85,23 @@ func StartBlockProcessor(testname string) {
 		tickCount := 0
 		for range intervalID.C {
 			tickCount++
+			timestamp := time.Now().Format(time.RFC3339)
+			queueSize := writeQueue.GetQueueSize()
+			fmt.Printf("[%s] [DEBUG] [BLOCK] Block processor tick #%d - Queue size: %d\n", timestamp, tickCount, queueSize)
+
 			// Wrap processBlock in a recover to prevent crashes from stopping the ticker
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						fmt.Printf("[ERROR] Panic in processBlock: %v\n", r)
+						timestamp := time.Now().Format(time.RFC3339)
+						fmt.Printf("[%s] [ERROR] [BLOCK] Panic in processBlock: %v\n", timestamp, r)
 					}
 				}()
+				processStartTime := time.Now()
 				processBlock()
+				processDuration := time.Since(processStartTime)
+				timestamp := time.Now().Format(time.RFC3339)
+				fmt.Printf("[%s] [DEBUG] [BLOCK] processBlock() completed in %v\n", timestamp, processDuration)
 			}()
 		}
 	}()
@@ -158,29 +173,7 @@ func processBlock() {
 	}
 	ctx := context.Background()
 
-	// Time removeExpiredEntities separately and create delete events
-	removeStartTime := time.Now()
-	logBlockDebug(blockNumber, "Getting expired entities...")
-	expiredEntities, err := GetExpiredEntities(blockNumber)
-	if err != nil {
-		logBlockDebug(blockNumber, "Error getting expired entities: %v", err)
-	} else {
-		logBlockDebug(blockNumber, "Found %d expired entities", len(expiredEntities))
-		// Add delete operations for expired entities to the block
-		for _, entity := range expiredEntities {
-			// Convert entity key to Hash (32 bytes)
-			keyHash := sha256.Sum256([]byte(entity.Key))
-			deleteOp := events.Operation{
-				Delete: (*events.OPDelete)(&keyHash),
-			}
-			block.Operations = append(block.Operations, deleteOp)
-		}
-	}
-	removeDuration := time.Since(removeStartTime)
-	logBlockDebug(blockNumber, "Expired entities processed in %v", removeDuration)
-
 	// Time insertEntitiesBatch separately and create create events
-	insertStartTime := time.Now()
 	logBlockDebug(blockNumber, "Creating create events for %d entities...", len(pendingEntities))
 	for i, pendingEntity := range pendingEntities {
 		entity := &pendingEntity.Entity
@@ -196,6 +189,7 @@ func processBlock() {
 
 		// Convert entity key to Hash (32 bytes)
 		keyHash := sha256.Sum256(entityKey)
+		keyHashHex := common.Hash(keyHash).Hex()
 
 		// Convert owner address from hex string
 		var ownerAddr common.Address
@@ -221,6 +215,58 @@ func processBlock() {
 		txIndex := uint64(i / 10)
 		opIndex := uint64(i % 10)
 
+		// Calculate BTL
+		btl := uint64(entity.ExpiresAt - entity.LastModifiedAtBlock)
+
+		// Log detailed entity content for debugging
+		logBlockDebug(blockNumber, "Entity %d/%d: key=%s, payloadSize=%d, contentType=%s, owner=%s, btl=%d, txIndex=%d, opIndex=%d",
+			i+1, len(pendingEntities), keyHashHex, len(payload), entity.ContentType, ownerAddr.Hex(), btl, txIndex, opIndex)
+
+		// Log string attributes
+		if len(stringAttrs) > 0 {
+			attrsStr := ""
+			first := true
+			for k, v := range stringAttrs {
+				if !first {
+					attrsStr += ", "
+				}
+				attrsStr += fmt.Sprintf("%s=%s", k, v)
+				first = false
+			}
+			logBlockDebug(blockNumber, "Entity %d/%d string attributes: %s", i+1, len(pendingEntities), attrsStr)
+		}
+
+		// Log numeric attributes
+		if len(numericAttrs) > 0 {
+			attrsStr := ""
+			first := true
+			for k, v := range numericAttrs {
+				if !first {
+					attrsStr += ", "
+				}
+				attrsStr += fmt.Sprintf("%s=%d", k, v)
+				first = false
+			}
+			logBlockDebug(blockNumber, "Entity %d/%d numeric attributes: %s", i+1, len(pendingEntities), attrsStr)
+		}
+
+		// Log payload preview (first 100 bytes if available)
+		if len(payload) > 0 {
+			previewLen := 100
+			if len(payload) < previewLen {
+				previewLen = len(payload)
+			}
+			// Show first few bytes as hex
+			previewHex := fmt.Sprintf("%x", payload[:previewLen])
+			if len(payload) > previewLen {
+				logBlockDebug(blockNumber, "Entity %d/%d payload preview (first %d/%d bytes): %s...", i+1, len(pendingEntities), previewLen, len(payload), previewHex)
+			} else {
+				logBlockDebug(blockNumber, "Entity %d/%d payload (%d bytes): %s", i+1, len(pendingEntities), len(payload), previewHex)
+			}
+		} else {
+			logBlockDebug(blockNumber, "Entity %d/%d has empty payload", i+1, len(pendingEntities))
+		}
+
 		// Add create operation to the block
 		createOp := events.Operation{
 			TxIndex: txIndex,
@@ -228,7 +274,7 @@ func processBlock() {
 			Create: &events.OPCreate{
 				Key:               common.Hash(keyHash),
 				ContentType:       entity.ContentType,
-				BTL:               uint64(entity.ExpiresAt - entity.LastModifiedAtBlock),
+				BTL:               btl,
 				Owner:             ownerAddr,
 				Content:           payload,
 				StringAttributes:  stringAttrs,
@@ -237,8 +283,21 @@ func processBlock() {
 		}
 		block.Operations = append(block.Operations, createOp)
 	}
+	// Log summary of all entities in the block
+	totalPayloadSize := 0
+	totalStringAttrs := 0
+	totalNumericAttrs := 0
+	for _, op := range block.Operations {
+		if op.Create != nil {
+			totalPayloadSize += len(op.Create.Content)
+			totalStringAttrs += len(op.Create.StringAttributes)
+			totalNumericAttrs += len(op.Create.NumericAttributes)
+		}
+	}
 	logBlockDebug(blockNumber, "Created %d total operations (%d creates, %d deletes)",
 		len(block.Operations), len(pendingEntities), len(block.Operations)-len(pendingEntities))
+	logBlockDebug(blockNumber, "Block summary: totalPayloadSize=%d bytes, totalStringAttrs=%d, totalNumericAttrs=%d",
+		totalPayloadSize, totalStringAttrs, totalNumericAttrs)
 
 	// Use pusher to create block event batches
 	// Create BlockBatch with the single block
@@ -249,8 +308,8 @@ func processBlock() {
 
 	// Push the block batch to the shared PushIterator
 	// FollowEvents (running in background) will pick it up automatically
-	fmt.Printf("[BLOCK] Block %d: Pushing block batch with %d operations to iterator (block number: %d)\n",
-		blockNumber, len(block.Operations), block.Number)
+	logBlockInfoMsg(blockNumber, "Pushing block batch with %d operations to iterator (block number: %d)",
+		len(block.Operations), block.Number)
 
 	// Log first operation details for debugging
 	if len(block.Operations) > 0 {
@@ -262,21 +321,51 @@ func processBlock() {
 	}
 
 	// Push the batch to the shared iterator - FollowEvents will process it
-	pushIterator.Push(ctx, blockBatch)
-	logBlockInfoMsg(blockNumber, "Block batch pushed to iterator, FollowEvents will process it")
+	// Note: Push() may block if the iterator buffer is full, but it should not block indefinitely
+	logBlockDebug(blockNumber, "Calling pushIterator.Push()...")
+	pushStartTime := time.Now()
 
-	insertDuration := time.Since(insertStartTime)
+	// Use a goroutine with timeout to detect if Push() is blocking
+	pushDone := make(chan bool, 1)
+	var pushErr error
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				timestamp := time.Now().Format(time.RFC3339)
+				fmt.Printf("[%s] [ERROR] [BLOCK] Panic in pushIterator.Push(): %v\n", timestamp, r)
+				pushErr = fmt.Errorf("panic: %v", r)
+				pushDone <- true
+			}
+		}()
+		pushIterator.Push(ctx, blockBatch)
+		pushDone <- true
+	}()
+
+	// Wait for push with timeout
+	select {
+	case <-pushDone:
+		pushDuration := time.Since(pushStartTime)
+		if pushErr != nil {
+			logBlockDebug(blockNumber, "pushIterator.Push() failed: %v", pushErr)
+		} else {
+			logBlockDebug(blockNumber, "pushIterator.Push() completed in %v", pushDuration)
+		}
+	case <-time.After(5 * time.Second):
+		timestamp := time.Now().Format(time.RFC3339)
+		fmt.Printf("[%s] [ERROR] [BLOCK] pushIterator.Push() blocked for more than 5 seconds! This may indicate FollowEvents is not consuming batches.\n", timestamp)
+		logBlockDebug(blockNumber, "pushIterator.Push() timeout - FollowEvents may be stuck")
+	}
+
+	logBlockInfoMsg(blockNumber, "Block batch pushed to iterator, FollowEvents will process it")
 
 	totalDuration := time.Since(totalStartTime)
 	logBlockInfoMsg(blockNumber, "Processed %d entities - %.2fms", len(pendingEntities), totalDuration.Seconds()*1000)
 
 	// Log to processing.log
 	logToProcessingLog(
-		fmt.Sprintf("%s BLOCK %d %d %d %d %d %d %d",
+		fmt.Sprintf("%s BLOCK %d %d %d %d %d",
 			testName,
 			blockNumber,
-			int(insertDuration.Milliseconds()),
-			int(removeDuration.Milliseconds()),
 			int(totalDuration.Milliseconds()),
 			len(pendingEntities),
 			stringCount,
