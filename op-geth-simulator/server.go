@@ -69,12 +69,25 @@ func requestLoggerMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 
 		duration := time.Since(startTime)
-		fmt.Printf("[%s] %s %s - %d - %dms\n",
-			time.Now().Format(time.RFC3339),
+		timestamp := time.Now().Format(time.RFC3339)
+		statusCode := rw.statusCode
+		durationMs := duration.Milliseconds()
+
+		// Determine log level based on status code
+		level := "INFO"
+		if statusCode >= 500 {
+			level = "ERROR"
+		} else if statusCode >= 400 {
+			level = "WARN"
+		}
+
+		fmt.Printf("[%s] [%s] %s %s - %d - %dms\n",
+			timestamp,
+			level,
 			r.Method,
 			r.URL.Path,
-			rw.statusCode,
-			duration.Milliseconds(),
+			statusCode,
+			durationMs,
 		)
 
 		// Warn if request takes more than 500ms

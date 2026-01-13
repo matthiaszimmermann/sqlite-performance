@@ -139,17 +139,17 @@ func processBlock() {
 		// Still log that we're checking, but less frequently
 		queueSize := writeQueue.GetQueueSize()
 		if queueSize > 0 {
-			fmt.Printf("[BLOCK] Block %d: No entities to process yet (queue size: %d)\n", blockNumber, queueSize)
+			logBlockInfoMsg(blockNumber, "No entities to process yet (queue size: %d)", queueSize)
 		}
 		return // No entities to process
 	}
 
-	fmt.Printf("Processing block %d: %d entities\n", blockNumber, len(pendingEntities))
-	fmt.Printf("[DEBUG] Block %d: Starting to build events...\n", blockNumber)
+	logBlockInfoMsg(blockNumber, "Processing %d entities", len(pendingEntities))
+	logBlockDebug(blockNumber, "Starting to build events...")
 
 	// Count attributes
 	stringCount, numericCount := countAttributes(pendingEntities)
-	fmt.Printf("[DEBUG] Block %d: Attributes counted - string: %d, numeric: %d\n", blockNumber, stringCount, numericCount)
+	logBlockDebug(blockNumber, "Attributes counted - string: %d, numeric: %d", stringCount, numericCount)
 
 	// Create a single block for all events in this block number
 	block := events.Block{
@@ -160,12 +160,12 @@ func processBlock() {
 
 	// Time removeExpiredEntities separately and create delete events
 	removeStartTime := time.Now()
-	fmt.Printf("[DEBUG] Block %d: Getting expired entities...\n", blockNumber)
+	logBlockDebug(blockNumber, "Getting expired entities...")
 	expiredEntities, err := GetExpiredEntities(blockNumber)
 	if err != nil {
-		fmt.Printf("[DEBUG] Block %d: Error getting expired entities: %v\n", blockNumber, err)
+		logBlockDebug(blockNumber, "Error getting expired entities: %v", err)
 	} else {
-		fmt.Printf("[DEBUG] Block %d: Found %d expired entities\n", blockNumber, len(expiredEntities))
+		logBlockDebug(blockNumber, "Found %d expired entities", len(expiredEntities))
 		// Add delete operations for expired entities to the block
 		for _, entity := range expiredEntities {
 			// Convert entity key to Hash (32 bytes)
@@ -177,11 +177,11 @@ func processBlock() {
 		}
 	}
 	removeDuration := time.Since(removeStartTime)
-	fmt.Printf("[DEBUG] Block %d: Expired entities processed in %v\n", blockNumber, removeDuration)
+	logBlockDebug(blockNumber, "Expired entities processed in %v", removeDuration)
 
 	// Time insertEntitiesBatch separately and create create events
 	insertStartTime := time.Now()
-	fmt.Printf("[DEBUG] Block %d: Creating create events for %d entities...\n", blockNumber, len(pendingEntities))
+	logBlockDebug(blockNumber, "Creating create events for %d entities...", len(pendingEntities))
 	for i, pendingEntity := range pendingEntities {
 		entity := &pendingEntity.Entity
 		entity.CreatedAtBlock = blockNumber
@@ -237,12 +237,12 @@ func processBlock() {
 		}
 		block.Operations = append(block.Operations, createOp)
 	}
-	fmt.Printf("[DEBUG] Block %d: Created %d total operations (%d creates, %d deletes)\n",
-		blockNumber, len(block.Operations), len(pendingEntities), len(block.Operations)-len(pendingEntities))
+	logBlockDebug(blockNumber, "Created %d total operations (%d creates, %d deletes)",
+		len(block.Operations), len(pendingEntities), len(block.Operations)-len(pendingEntities))
 
 	// Use pusher to create block event batches
 	// Create BlockBatch with the single block
-	fmt.Printf("[DEBUG] Block %d: Creating BlockBatch...\n", blockNumber)
+	logBlockDebug(blockNumber, "Creating BlockBatch...")
 	blockBatch := events.BlockBatch{
 		Blocks: []events.Block{block},
 	}
@@ -256,41 +256,19 @@ func processBlock() {
 	if len(block.Operations) > 0 {
 		firstOp := block.Operations[0]
 		if firstOp.Create != nil {
-			fmt.Printf("[BLOCK] Block %d: First operation is CREATE with key: %s, contentType: %s\n",
-				blockNumber, firstOp.Create.Key.Hex(), firstOp.Create.ContentType)
+			logBlockDebug(blockNumber, "First operation is CREATE with key: %s, contentType: %s",
+				firstOp.Create.Key.Hex(), firstOp.Create.ContentType)
 		}
 	}
 
 	// Push the batch to the shared iterator - FollowEvents will process it
 	pushIterator.Push(ctx, blockBatch)
-	fmt.Printf("[BLOCK] Block %d: Block batch pushed to iterator, FollowEvents will process it\n", blockNumber)
-
-	// // Update block number and verify in background (non-blocking)
-	// go func(blockNum int64) {
-	// 	// Give FollowEvents a moment to process
-	// 	time.Sleep(100 * time.Millisecond)
-
-	// 	// Update block number in store after processing
-	// 	if err := updateBlockNumberInStore(context.Background(), blockNum); err != nil {
-	// 		fmt.Printf("[BLOCK] Block %d: Warning - Failed to update block number in store: %v\n", blockNum, err)
-	// 	} else {
-	// 		fmt.Printf("[BLOCK] Block %d: Block number updated in store to %d\n", blockNum, blockNum)
-	// 	}
-
-	// 	// Verify entities were saved by checking count
-	// 	verifyCount, err := CountEntities()
-	// 	if err != nil {
-	// 		fmt.Printf("[BLOCK] Block %d: Warning - Could not verify entity count: %v\n", blockNum, err)
-	// 	} else {
-	// 		fmt.Printf("[BLOCK] Block %d: Database now contains %d total entities\n", blockNum, verifyCount)
-	// 	}
-	// }(blockNumber)
+	logBlockInfoMsg(blockNumber, "Block batch pushed to iterator, FollowEvents will process it")
 
 	insertDuration := time.Since(insertStartTime)
 
 	totalDuration := time.Since(totalStartTime)
-	message := fmt.Sprintf("[BLOCK] Block %d processed: %d entities - %.2fms", blockNumber, len(pendingEntities), totalDuration.Seconds()*1000)
-	fmt.Println(message)
+	logBlockInfoMsg(blockNumber, "Processed %d entities - %.2fms", len(pendingEntities), totalDuration.Seconds()*1000)
 
 	// Log to processing.log
 	logToProcessingLog(
@@ -310,18 +288,4 @@ func processBlock() {
 	if totalDuration > 1000*time.Millisecond {
 		logBlockWarning(blockNumber, len(pendingEntities), totalDuration)
 	}
-}
-
-// updateBlockNumberInStore updates the block number in the store after processing
-func updateBlockNumberInStore(ctx context.Context, blockNumber int64) error {
-	storeMutex.RLock()
-	s := storeInstance
-	storeMutex.RUnlock()
-
-	if s == nil {
-		return fmt.Errorf("store not initialized")
-	}
-
-	queries := s.NewQueries()
-	return queries.UpsertLastBlock(ctx, uint64(blockNumber))
 }

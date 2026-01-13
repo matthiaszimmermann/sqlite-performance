@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,7 +96,9 @@ func logQuery(queryType string, duration time.Duration, params map[string]interf
 
 // logDbOperation logs a database operation
 func logDbOperation(operation string, duration time.Duration) {
-	message := fmt.Sprintf("[DB] %s - %.2fms", operation, duration.Seconds()*1000)
+	timestamp := time.Now().Format(time.RFC3339)
+	durationMs := duration.Milliseconds()
+	message := fmt.Sprintf("[%s] [INFO] [DB] %s - %dms", timestamp, operation, durationMs)
 	fmt.Println(message)
 
 	// Warn if any query takes more than 200ms
@@ -108,15 +112,42 @@ func logToProcessingLog(message string) {
 	logToFile(processingLogFile, message)
 }
 
+// logBlockInfo logs block processing information with consistent format
+func logBlockInfo(level, category, message string) {
+	timestamp := time.Now().Format(time.RFC3339)
+	fmt.Printf("[%s] [%s] [%s] %s\n", timestamp, level, category, message)
+}
+
+// logBlockDebug logs debug information for block processing
+func logBlockDebug(blockNumber int64, format string, args ...interface{}) {
+	message := fmt.Sprintf("Block %d: %s", blockNumber, fmt.Sprintf(format, args...))
+	logBlockInfo("DEBUG", "BLOCK", message)
+}
+
+// logBlockInfoMsg logs info messages for block processing
+func logBlockInfoMsg(blockNumber int64, format string, args ...interface{}) {
+	message := fmt.Sprintf("Block %d: %s", blockNumber, fmt.Sprintf(format, args...))
+	logBlockInfo("INFO", "BLOCK", message)
+}
+
 // CustomSlogHandler is a slog handler that routes logs to files and stdout
 type CustomSlogHandler struct {
-	level slog.Level
+	level           slog.Level
+	batchStartTimes map[int64]time.Time // Track when batches start by block number
+	batchMutex      sync.Mutex          // Protect batchStartTimes map
 }
+
+var (
+	// Regex patterns to extract block numbers from log messages
+	newBatchRegex     = regexp.MustCompile(`firstBlock=(\d+)`)
+	blockUpdatedRegex = regexp.MustCompile(`block=(\d+)`)
+)
 
 // NewCustomSlogHandler creates a new custom slog handler
 func NewCustomSlogHandler() *CustomSlogHandler {
 	return &CustomSlogHandler{
-		level: slog.LevelInfo,
+		level:           slog.LevelInfo,
+		batchStartTimes: make(map[int64]time.Time),
 	}
 }
 
@@ -127,16 +158,19 @@ func (h *CustomSlogHandler) Enabled(ctx context.Context, level slog.Level) bool 
 
 // Handle processes the log record
 func (h *CustomSlogHandler) Handle(ctx context.Context, r slog.Record) error {
-	// Format the log message
+	// Format the log message and collect attributes for batch tracking
 	var msg strings.Builder
+	var attrs []slog.Attr
+
 	msg.WriteString(r.Time.Format(time.RFC3339))
 	msg.WriteString(" [")
 	msg.WriteString(r.Level.String())
 	msg.WriteString("] ")
 	msg.WriteString(r.Message)
 
-	// Add attributes
+	// Collect attributes and add to message
 	r.Attrs(func(a slog.Attr) bool {
+		attrs = append(attrs, a)
 		msg.WriteString(" ")
 		msg.WriteString(a.Key)
 		msg.WriteString("=")
@@ -145,6 +179,9 @@ func (h *CustomSlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	})
 
 	message := msg.String()
+
+	// Track batch write times - extract block number from attributes
+	h.trackBatchWriteTime(r.Message, attrs, r.Time)
 
 	// Always print to stdout
 	fmt.Println(message)
@@ -178,6 +215,95 @@ func (h *CustomSlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	}
 
 	return nil
+}
+
+// trackBatchWriteTime tracks the time between "new batch" and "block updated" logs
+func (h *CustomSlogHandler) trackBatchWriteTime(message string, attrs []slog.Attr, logTime time.Time) {
+	h.batchMutex.Lock()
+	defer h.batchMutex.Unlock()
+
+	var blockNum int64
+	var foundBlockNum bool
+
+	// Extract block number from attributes
+	for _, a := range attrs {
+		if a.Key == "firstBlock" || a.Key == "block" {
+			if intVal, ok := a.Value.Any().(int64); ok {
+				blockNum = intVal
+				foundBlockNum = true
+				break
+			} else if uintVal, ok := a.Value.Any().(uint64); ok {
+				blockNum = int64(uintVal)
+				foundBlockNum = true
+				break
+			} else if intVal, ok := a.Value.Any().(int); ok {
+				blockNum = int64(intVal)
+				foundBlockNum = true
+				break
+			}
+		}
+	}
+
+	// If block number not found in attributes, try parsing from message
+	if !foundBlockNum {
+		if strings.Contains(message, "new batch") {
+			matches := newBatchRegex.FindStringSubmatch(message)
+			if len(matches) >= 2 {
+				if _, err := fmt.Sscanf(matches[1], "%d", &blockNum); err == nil {
+					foundBlockNum = true
+				}
+			}
+		} else if strings.Contains(message, "block updated") {
+			matches := blockUpdatedRegex.FindStringSubmatch(message)
+			if len(matches) >= 2 {
+				if _, err := fmt.Sscanf(matches[1], "%d", &blockNum); err == nil {
+					foundBlockNum = true
+				}
+			}
+		}
+	}
+
+	// Check if this is a "new batch" log
+	if strings.Contains(message, "new batch") && foundBlockNum {
+		h.batchStartTimes[blockNum] = logTime
+		return
+	}
+
+	// Check if this is a "block updated" log
+	if strings.Contains(message, "block updated") && foundBlockNum {
+		// Check if we have a start time for this block
+		if startTime, exists := h.batchStartTimes[blockNum]; exists {
+			duration := logTime.Sub(startTime)
+			durationMs := duration.Milliseconds()
+
+			// Get test name
+			testName := currentTestName
+			if testName == "" {
+				testName = getDefaultTestName()
+			}
+
+			// Log the block write time measurement
+			timestamp := logTime.Format(time.RFC3339)
+			writeTimeLog := fmt.Sprintf("[%s] [INFO] [BLOCK] %s Block %d: Write time - %dms", timestamp, testName, blockNum, durationMs)
+			fmt.Println(writeTimeLog)
+
+			// Also write to processing.log
+			logToFile(processingLogFile, fmt.Sprintf("%s Block %d write time: %dms", testName, blockNum, durationMs))
+
+			// Clean up the start time
+			delete(h.batchStartTimes, blockNum)
+
+			// Warn if write time is too long
+			if duration > 1000*time.Millisecond {
+				logBlockWarning(blockNum, 0, duration)
+			}
+		} else {
+			// If we don't have a start time, log a warning (might have missed the "new batch" log)
+			timestamp := logTime.Format(time.RFC3339)
+			fmt.Printf("[%s] [WARN] [BLOCK] Block %d: Write time measurement skipped (no start time found)\n", timestamp, blockNum)
+		}
+		return
+	}
 }
 
 // WithAttrs returns a new handler with the given attributes
