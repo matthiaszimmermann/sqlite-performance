@@ -81,8 +81,6 @@ class GlobalSampleData:
     node_ids: List[str] = []
     workload_ids: List[str] = []
     entity_keys: List[str] = []  # Stored as hex strings for API
-    node_id_to_key: Dict[str, str] = {}  # Mapping node_id -> entity_key (hex)
-    workload_id_to_key: Dict[str, str] = {}  # Mapping workload_id -> entity_key (hex)
     current_block: int = 1
     initialized: bool = False
     
@@ -101,88 +99,78 @@ class GlobalSampleData:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
         
-        # Get current block
-        try:
-            cursor.execute("SELECT block FROM last_block WHERE id = 1")
-            row = cursor.fetchone()
-            if row:
-                cls.current_block = row[0]
-            else:
-                # Fallback: get max from_block
-                cursor.execute("SELECT MAX(from_block) FROM string_attributes")
-                row = cursor.fetchone()
-                cls.current_block = row[0] if row and row[0] else 1
-        except Exception:
-            cls.current_block = 1
-        
-        # Load node IDs and create mapping to entity_keys
+        # Load node IDs from new schema (string_attributes_values_bitmaps)
         try:
             cursor.execute("""
-                SELECT DISTINCT sa.value, sa.entity_key
-                FROM string_attributes sa
-                WHERE sa.key = 'node_id'
-                  AND sa.from_block <= ? AND sa.to_block > ?
+                SELECT DISTINCT value
+                FROM string_attributes_values_bitmaps
+                WHERE name = 'node_id'
                 ORDER BY RANDOM()
                 LIMIT ?
-            """, (cls.current_block, cls.current_block, SAMPLE_SIZE_IDS))
+            """, (SAMPLE_SIZE_IDS,))
             
             for row in cursor.fetchall():
                 node_id = row[0]
-                entity_key = row[1]
                 cls.node_ids.append(node_id)
-                if isinstance(entity_key, bytes):
-                    cls.node_id_to_key[node_id] = f"0x{entity_key.hex()}"
-                else:
-                    key_str = str(entity_key)
-                    cls.node_id_to_key[node_id] = key_str if key_str.startswith("0x") else f"0x{key_str}"
         except Exception as e:
             print(f"Error loading node IDs: {e}")
         
-        # Load workload IDs and create mapping to entity_keys
+        # Load workload IDs from new schema (string_attributes_values_bitmaps)
         try:
             cursor.execute("""
-                SELECT DISTINCT sa.value, sa.entity_key
-                FROM string_attributes sa
-                WHERE sa.key = 'workload_id'
-                  AND sa.from_block <= ? AND sa.to_block > ?
+                SELECT DISTINCT value
+                FROM string_attributes_values_bitmaps
+                WHERE name = 'workload_id'
                 ORDER BY RANDOM()
                 LIMIT ?
-            """, (cls.current_block, cls.current_block, SAMPLE_SIZE_IDS))
+            """, (SAMPLE_SIZE_IDS,))
             
             for row in cursor.fetchall():
                 workload_id = row[0]
-                entity_key = row[1]
                 cls.workload_ids.append(workload_id)
-                if isinstance(entity_key, bytes):
-                    cls.workload_id_to_key[workload_id] = f"0x{entity_key.hex()}"
-                else:
-                    key_str = str(entity_key)
-                    cls.workload_id_to_key[workload_id] = key_str if key_str.startswith("0x") else f"0x{key_str}"
         except Exception as e:
             print(f"Error loading workload IDs: {e}")
         
-        # Load entity keys (for direct lookups)
+        # Load entity keys (for direct lookups) - get single entity key as requested
         try:
-            cursor.execute("""
-                SELECT DISTINCT entity_key FROM payloads
-                WHERE from_block <= ? AND to_block > ?
-                ORDER BY RANDOM()
-                LIMIT ?
-            """, (cls.current_block, cls.current_block, SAMPLE_SIZE_KEYS))
-            
-            for row in cursor.fetchall():
-                entity_key = row[0]
-                if isinstance(entity_key, bytes):
-                    # Convert bytes to hex string and add 0x prefix
-                    key_hex = entity_key.hex()
-                    cls.entity_keys.append(f"0x{key_hex}")
-                else:
-                    # Already a string, ensure it has 0x prefix
-                    key_str = str(entity_key)
-                    if not key_str.startswith("0x"):
-                        cls.entity_keys.append(f"0x{key_str}")
+            # Try the user's query first (with id column)
+            try:
+                cursor.execute("SELECT * FROM payloads ORDER BY id DESC LIMIT 1")
+                row = cursor.fetchone()
+                if row:
+                    # Get entity_key from the row by column name
+                    columns = [description[0] for description in cursor.description]
+                    if 'entity_key' in columns:
+                        entity_key_idx = columns.index('entity_key')
+                        entity_key = row[entity_key_idx]
                     else:
-                        cls.entity_keys.append(key_str)
+                        # Fallback: assume entity_key is the first column
+                        entity_key = row[0]
+                    
+                    if isinstance(entity_key, bytes):
+                        key_hex = entity_key.hex()
+                        cls.entity_keys.append(f"0x{key_hex}")
+                    else:
+                        key_str = str(entity_key)
+                        if not key_str.startswith("0x"):
+                            cls.entity_keys.append(f"0x{key_str}")
+                        else:
+                            cls.entity_keys.append(key_str)
+            except sqlite3.OperationalError:
+                # If id column doesn't exist, try with from_block
+                cursor.execute("SELECT entity_key FROM payloads ORDER BY from_block DESC LIMIT 1")
+                row = cursor.fetchone()
+                if row:
+                    entity_key = row[0]
+                    if isinstance(entity_key, bytes):
+                        key_hex = entity_key.hex()
+                        cls.entity_keys.append(f"0x{key_hex}")
+                    else:
+                        key_str = str(entity_key)
+                        if not key_str.startswith("0x"):
+                            cls.entity_keys.append(f"0x{key_str}")
+                        else:
+                            cls.entity_keys.append(key_str)
         except Exception as e:
             print(f"Error loading entity keys: {e}")
         
@@ -219,23 +207,22 @@ class DataCenterReadUser(FastHttpUser):
         
         # Randomly choose node or workload ID
         rng = random.Random()
-        entity_key = None
+        entity_id = None
+        id_key = None
         
         if rng.random() < 0.5 and GlobalSampleData.node_ids:
             entity_id = rng.choice(GlobalSampleData.node_ids)
-            entity_key = GlobalSampleData.node_id_to_key.get(entity_id)
+            id_key = "node_id"
         elif GlobalSampleData.workload_ids:
             entity_id = rng.choice(GlobalSampleData.workload_ids)
-            entity_key = GlobalSampleData.workload_id_to_key.get(entity_id)
+            id_key = "workload_id"
         elif GlobalSampleData.node_ids:
             entity_id = rng.choice(GlobalSampleData.node_ids)
-            entity_key = GlobalSampleData.node_id_to_key.get(entity_id)
+            id_key = "node_id"
         
-        if not entity_key:
+        if not entity_id:
             return
         
-        # Determine if it's a node or workload ID
-        id_key = "node_id" if entity_id and entity_id.startswith("node_") else "workload_id"
         query_body = {
             "stringAnnotations": {
                 id_key: entity_id,
@@ -244,7 +231,7 @@ class DataCenterReadUser(FastHttpUser):
         
         debug_log(f"[DEBUG] point_by_id: querying {id_key}={entity_id}")
         
-        # Use GET /entities/query endpoint
+        # Use POST /entities/query endpoint
         with self.client.post("/entities/query", json=query_body, catch_response=True, name="point_by_id") as response:
             if response.status_code != 200:
                 debug_log(f"[DEBUG] point_by_id: FAILED - status={response.status_code}, entity_id={entity_id}")
@@ -264,7 +251,8 @@ class DataCenterReadUser(FastHttpUser):
         if not GlobalSampleData.entity_keys:
             return
         
-        entity_key = random.choice(GlobalSampleData.entity_keys)
+        # Use the single entity key (or first one if multiple somehow)
+        entity_key = GlobalSampleData.entity_keys[0]
         debug_log(f"[DEBUG] point_by_key: querying entity_key={entity_key[:20]}...")
         
         # Use GET /entities/:key endpoint (URL encode the key)
