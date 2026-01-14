@@ -76,8 +76,8 @@ func GetEntityByKey(key string) (*Entity, error) {
 	keyHashCommon := common.Hash(keyHash)
 	arkivQuery := fmt.Sprintf(`key = "%s"`, keyHashCommon.Hex())
 
-	atBlock := hexutil.Uint64(currentBlock)
-	resultsPerPage := hexutil.Uint64(1)
+	atBlock := uint64(currentBlock)
+	resultsPerPage := uint64(1)
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -127,8 +127,8 @@ func QueryEntities(ownerAddress string, stringAnnotations map[string]string, num
 	arkivQuery := buildArkivQuery(ownerAddress, stringAnnotations, numericAnnotations)
 
 	// Use SQLiteStore.QueryEntities with proper Options
-	atBlock := hexutil.Uint64(currentBlock)
-	resultsPerPage := hexutil.Uint64(limit)
+	atBlock := uint64(currentBlock)
+	resultsPerPage := uint64(limit)
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -220,8 +220,8 @@ func CountEntities() (int, error) {
 	currentBlock := GetCurrentBlockNumber()
 
 	// Query all entities with empty query to get total count
-	atBlock := hexutil.Uint64(currentBlock)
-	resultsPerPage := hexutil.Uint64(1) // We only need the count
+	atBlock := uint64(currentBlock)
+	resultsPerPage := uint64(1) // We only need the count
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -232,7 +232,7 @@ func CountEntities() (int, error) {
 		return 0, fmt.Errorf("failed to count entities: %w", err)
 	}
 
-	return int(response.TotalCount), nil
+	return int(len(response.Data)), nil
 }
 
 // GetExpiredEntities retrieves entities that expire at the given block number
@@ -251,8 +251,8 @@ func GetExpiredEntities(blockNumber int64) ([]*Entity, error) {
 	// Query for entities that expire at this block number
 	// Expiration is stored as $expiration in numeric attributes
 	arkivQuery := fmt.Sprintf("$expiration = %d", blockNumber)
-	atBlock := hexutil.Uint64(currentBlock)
-	resultsPerPage := hexutil.Uint64(10000) // Large limit to get all expired entities
+	atBlock := uint64(currentBlock)
+	resultsPerPage := uint64(10000) // Large limit to get all expired entities
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
