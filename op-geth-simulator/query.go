@@ -232,8 +232,9 @@ func CountEntities() (int, error) {
 	return int(len(response.Data)), nil
 }
 
-// GetExpiredEntities retrieves entities that expire at the given block number
-func GetExpiredEntities(blockNumber int64) ([]*Entity, error) {
+// GetExpiredEntities retrieves entity key hashes whose expiration is less than or equal to the given block number
+// Only returns entity key hashes (not full entity data) for performance
+func GetExpiredEntities(blockNumber int64) ([]common.Hash, error) {
 	storeMutex.RLock()
 	s := storeInstance
 	storeMutex.RUnlock()
@@ -245,14 +246,32 @@ func GetExpiredEntities(blockNumber int64) ([]*Entity, error) {
 	ctx := context.Background()
 	currentBlock := GetCurrentBlockNumber()
 
-	// Query for entities that expire at this block number
+	// Query for entities that expire at or before this block number
 	// Expiration is stored as $expiration in numeric attributes
+	// Use <= operator to get all entities that have expired
 	arkivQuery := fmt.Sprintf("$expiration = %d", blockNumber)
 	atBlock := uint64(currentBlock)
 	resultsPerPage := uint64(10000) // Large limit to get all expired entities
+
+	// Use IncludeData to only fetch the key field for performance
+	includeData := &sqlitestore.IncludeData{
+		Key:                         true,
+		Attributes:                  false,
+		SyntheticAttributes:         false,
+		Payload:                     false,
+		ContentType:                 false,
+		Expiration:                  false,
+		Owner:                       false,
+		CreatedAtBlock:              false,
+		LastModifiedAtBlock:         false,
+		TransactionIndexInBlock:     false,
+		OperationIndexInTransaction: false,
+	}
+
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
+		IncludeData:    includeData,
 	}
 
 	response, err := s.QueryEntities(ctx, arkivQuery, options)
@@ -260,17 +279,24 @@ func GetExpiredEntities(blockNumber int64) ([]*Entity, error) {
 		return nil, fmt.Errorf("failed to query expired entities: %w", err)
 	}
 
-	// Convert QueryResponse.Data to entities
-	entities := make([]*Entity, 0, len(response.Data))
+	// Extract only entity key hashes from the response
+	entityKeyHashes := make([]common.Hash, 0, len(response.Data))
 	for _, dataItem := range response.Data {
-		entity, err := parseEntityData(dataItem, "")
-		if err != nil {
+		var entityData struct {
+			Key *common.Hash `json:"key,omitempty"`
+		}
+
+		if err := json.Unmarshal(dataItem, &entityData); err != nil {
 			continue // Skip invalid entries
 		}
-		entities = append(entities, entity)
+
+		if entityData.Key != nil {
+			// Store the hash directly (this is what we need for delete operations)
+			entityKeyHashes = append(entityKeyHashes, *entityData.Key)
+		}
 	}
 
-	return entities, nil
+	return entityKeyHashes, nil
 }
 
 // GetCurrentBlockNumber gets the current block number

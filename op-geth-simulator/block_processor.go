@@ -150,28 +150,26 @@ func processBlock() {
 	blockNumber := writeQueue.GetCurrentBlockNumber()
 	pendingEntities := writeQueue.DequeueAll()
 
-	if len(pendingEntities) == 0 {
-		// Still log that we're checking, but less frequently
-		queueSize := writeQueue.GetQueueSize()
-		if queueSize > 0 {
-			logBlockInfoMsg(blockNumber, "No entities to process yet (queue size: %d)", queueSize)
-		}
-		return // No entities to process
-	}
-
-	logBlockInfoMsg(blockNumber, "Processing %d entities", len(pendingEntities))
-	logBlockDebug(blockNumber, "Starting to build events...")
-
-	// Count attributes
-	stringCount, numericCount := countAttributes(pendingEntities)
-	logBlockDebug(blockNumber, "Attributes counted - string: %d, numeric: %d", stringCount, numericCount)
-
 	// Create a single block for all events in this block number
 	block := events.Block{
 		Number:     uint64(blockNumber),
 		Operations: []events.Operation{},
 	}
 	ctx := context.Background()
+
+	if len(pendingEntities) == 0 {
+		logBlockDebug(blockNumber, "No pending entities to process")
+		return
+	}
+
+	// Count attributes for pending entities
+	stringCount := 0
+	numericCount := 0
+	stringCount, numericCount = countAttributes(pendingEntities)
+
+	logBlockInfoMsg(blockNumber, "Processing %d entities", len(pendingEntities))
+	logBlockDebug(blockNumber, "Starting to build events...")
+	logBlockDebug(blockNumber, "Attributes counted - string: %d, numeric: %d", stringCount, numericCount)
 
 	// Time insertEntitiesBatch separately and create create events
 	logBlockDebug(blockNumber, "Creating create events for %d entities...", len(pendingEntities))
@@ -283,21 +281,71 @@ func processBlock() {
 		}
 		block.Operations = append(block.Operations, createOp)
 	}
+
+	// Get expired entity key hashes and create delete operations
+	logBlockDebug(blockNumber, "Querying for expired entities (expiration <= %d)...", blockNumber)
+	expiredEntityKeyHashes, err := GetExpiredEntities(blockNumber)
+	if err != nil {
+		logBlockDebug(blockNumber, "Error querying expired entities: %v", err)
+	} else {
+		logBlockInfoMsg(blockNumber, "Found %d expired entities to delete", len(expiredEntityKeyHashes))
+
+		// Start operation index after all create operations
+		startOpIndex := len(block.Operations)
+
+		for i, keyHash := range expiredEntityKeyHashes {
+			keyHashHex := keyHash.Hex()
+
+			logBlockDebug(blockNumber, "Expired entity %d/%d: key=%s", i+1, len(expiredEntityKeyHashes), keyHashHex)
+
+			// Calculate transaction and operation indices (10 operations per transaction)
+			// Continue from where create operations left off
+			opIndex := startOpIndex + i
+			txIndex := uint64(opIndex / 10)
+			opIndexInTx := uint64(opIndex % 10)
+
+			// Create delete operation
+			// OPDelete is a type alias for common.Hash
+			deleteOp := events.Operation{
+				TxIndex: txIndex,
+				OpIndex: opIndexInTx,
+				Delete:  (*events.OPDelete)(&keyHash),
+			}
+			block.Operations = append(block.Operations, deleteOp)
+		}
+
+		if len(expiredEntityKeyHashes) > 0 {
+			logBlockInfoMsg(blockNumber, "Created %d delete operations for expired entities", len(expiredEntityKeyHashes))
+		}
+	}
+
 	// Log summary of all entities in the block
 	totalPayloadSize := 0
 	totalStringAttrs := 0
 	totalNumericAttrs := 0
+	createCount := 0
+	deleteCount := 0
 	for _, op := range block.Operations {
 		if op.Create != nil {
 			totalPayloadSize += len(op.Create.Content)
 			totalStringAttrs += len(op.Create.StringAttributes)
 			totalNumericAttrs += len(op.Create.NumericAttributes)
+			createCount++
+		}
+		if op.Delete != nil {
+			deleteCount++
 		}
 	}
 	logBlockDebug(blockNumber, "Created %d total operations (%d creates, %d deletes)",
-		len(block.Operations), len(pendingEntities), len(block.Operations)-len(pendingEntities))
+		len(block.Operations), createCount, deleteCount)
 	logBlockDebug(blockNumber, "Block summary: totalPayloadSize=%d bytes, totalStringAttrs=%d, totalNumericAttrs=%d",
 		totalPayloadSize, totalStringAttrs, totalNumericAttrs)
+
+	// Only push block if there are operations (creates or deletes)
+	if len(block.Operations) == 0 {
+		logBlockDebug(blockNumber, "No operations to process, skipping block push")
+		return
+	}
 
 	// Use pusher to create block event batches
 	// Create BlockBatch with the single block
@@ -359,7 +407,8 @@ func processBlock() {
 	logBlockInfoMsg(blockNumber, "Block batch pushed to iterator, FollowEvents will process it")
 
 	totalDuration := time.Since(totalStartTime)
-	logBlockInfoMsg(blockNumber, "Processed %d entities - %.2fms", len(pendingEntities), totalDuration.Seconds()*1000)
+	logBlockInfoMsg(blockNumber, "Processed %d operations (%d creates, %d deletes) - %.2fms",
+		len(block.Operations), createCount, deleteCount, totalDuration.Seconds()*1000)
 
 	// Log to processing.log
 	logToProcessingLog(
@@ -375,6 +424,6 @@ func processBlock() {
 
 	// Warn if block processing takes more than 1000ms
 	if totalDuration > 1000*time.Millisecond {
-		logBlockWarning(blockNumber, len(pendingEntities), totalDuration)
+		logBlockWarning(blockNumber, len(block.Operations), totalDuration)
 	}
 }
