@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -55,7 +54,7 @@ func GetEntityByKey(key string) (*Entity, error) {
 		duration := time.Since(startTime)
 		logDbOperation(fmt.Sprintf("getEntityByKey(key=%s)", key), duration)
 		logQuery("getEntityByKey", duration, map[string]interface{}{
-			"key": key,
+			"$key": key,
 		})
 	}()
 
@@ -70,11 +69,7 @@ func GetEntityByKey(key string) (*Entity, error) {
 	ctx := context.Background()
 	currentBlock := GetCurrentBlockNumber()
 
-	// Convert key to hash format for query (same as in block_processor.go)
-	// The key is stored as SHA256 hash, so we need to hash it first
-	keyHash := sha256.Sum256([]byte(key))
-	keyHashCommon := common.Hash(keyHash)
-	arkivQuery := fmt.Sprintf(`key = "%s"`, keyHashCommon.Hex())
+	arkivQuery := fmt.Sprintf(`$key = "%s"`, key)
 
 	atBlock := uint64(currentBlock)
 	resultsPerPage := uint64(1)
@@ -197,6 +192,8 @@ func buildArkivQuery(
 	for i := 1; i < len(conditions); i++ {
 		result += " AND " + conditions[i]
 	}
+	log.Printf("Query has been built: %s", result)
+
 	return result
 }
 
