@@ -148,7 +148,7 @@ func processBlock() {
 
 	// Get block number BEFORE dequeuing (since DequeueAll increments it)
 	blockNumber := writeQueue.GetCurrentBlockNumber()
-	pendingEntities := writeQueue.DequeueAll()
+	pendingCreates, pendingUpdates := writeQueue.DequeueAll()
 
 	// Create a single block for all events in this block number
 	block := events.Block{
@@ -157,7 +157,7 @@ func processBlock() {
 	}
 	ctx := context.Background()
 
-	if len(pendingEntities) == 0 {
+	if len(pendingCreates) == 0 && len(pendingUpdates) == 0 {
 		logBlockDebug(blockNumber, "No pending entities to process")
 		return
 	}
@@ -165,20 +165,24 @@ func processBlock() {
 	// Count attributes for pending entities
 	stringCount := 0
 	numericCount := 0
-	stringCount, numericCount = countAttributes(pendingEntities)
+	stringCreates, numericCreates := countAttributes(pendingCreates)
+	stringUpdates, numericUpdates := countAttributes(pendingUpdates)
+	stringCount = stringCreates + stringUpdates
+	numericCount = numericCreates + numericUpdates
 
-	logBlockInfoMsg(blockNumber, "Processing %d entities", len(pendingEntities))
+	totalPending := len(pendingCreates) + len(pendingUpdates)
+	logBlockInfoMsg(blockNumber, "Processing %d entities (%d creates, %d updates)", totalPending, len(pendingCreates), len(pendingUpdates))
 	logBlockDebug(blockNumber, "Starting to build events...")
 	logBlockDebug(blockNumber, "Attributes counted - string: %d, numeric: %d", stringCount, numericCount)
 
-	// Time insertEntitiesBatch separately and create create events
-	logBlockDebug(blockNumber, "Creating create events for %d entities...", len(pendingEntities))
-	for i, pendingEntity := range pendingEntities {
+	// Create CREATE events first
+	logBlockDebug(blockNumber, "Creating CREATE events for %d entities...", len(pendingCreates))
+	for i, pendingEntity := range pendingCreates {
 		entity := &pendingEntity.Entity
 		entity.CreatedAtBlock = blockNumber
 		entity.LastModifiedAtBlock = blockNumber
 
-		// Create create event for the entity
+		// Create CREATE event for the entity
 		entityKey := []byte(entity.Key)
 		var payload []byte
 		if len(entity.Payload) > 0 {
@@ -210,15 +214,16 @@ func processBlock() {
 		}
 
 		// Calculate transaction and operation indices (10 operations per transaction)
-		txIndex := uint64(i / 10)
-		opIndex := uint64(i % 10)
+		opNum := i
+		txIndex := uint64(opNum / 10)
+		opIndex := uint64(opNum % 10)
 
 		// Calculate BTL
 		btl := uint64(entity.ExpiresAt - entity.LastModifiedAtBlock)
 
 		// Log detailed entity content for debugging
 		logBlockDebug(blockNumber, "Entity %d/%d: key=%s, payloadSize=%d, contentType=%s, owner=%s, btl=%d, txIndex=%d, opIndex=%d",
-			i+1, len(pendingEntities), keyHashHex, len(payload), entity.ContentType, ownerAddr.Hex(), btl, txIndex, opIndex)
+			i+1, len(pendingCreates), keyHashHex, len(payload), entity.ContentType, ownerAddr.Hex(), btl, txIndex, opIndex)
 
 		// Log string attributes
 		if len(stringAttrs) > 0 {
@@ -231,7 +236,7 @@ func processBlock() {
 				attrsStr += fmt.Sprintf("%s=%s", k, v)
 				first = false
 			}
-			logBlockDebug(blockNumber, "Entity %d/%d string attributes: %s", i+1, len(pendingEntities), attrsStr)
+			logBlockDebug(blockNumber, "Entity %d/%d string attributes: %s", i+1, len(pendingCreates), attrsStr)
 		}
 
 		// Log numeric attributes
@@ -245,7 +250,7 @@ func processBlock() {
 				attrsStr += fmt.Sprintf("%s=%d", k, v)
 				first = false
 			}
-			logBlockDebug(blockNumber, "Entity %d/%d numeric attributes: %s", i+1, len(pendingEntities), attrsStr)
+			logBlockDebug(blockNumber, "Entity %d/%d numeric attributes: %s", i+1, len(pendingCreates), attrsStr)
 		}
 
 		// Log payload preview (first 100 bytes if available)
@@ -257,12 +262,12 @@ func processBlock() {
 			// Show first few bytes as hex
 			previewHex := fmt.Sprintf("%x", payload[:previewLen])
 			if len(payload) > previewLen {
-				logBlockDebug(blockNumber, "Entity %d/%d payload preview (first %d/%d bytes): %s...", i+1, len(pendingEntities), previewLen, len(payload), previewHex)
+				logBlockDebug(blockNumber, "Entity %d/%d payload preview (first %d/%d bytes): %s...", i+1, len(pendingCreates), previewLen, len(payload), previewHex)
 			} else {
-				logBlockDebug(blockNumber, "Entity %d/%d payload (%d bytes): %s", i+1, len(pendingEntities), len(payload), previewHex)
+				logBlockDebug(blockNumber, "Entity %d/%d payload (%d bytes): %s", i+1, len(pendingCreates), len(payload), previewHex)
 			}
 		} else {
-			logBlockDebug(blockNumber, "Entity %d/%d has empty payload", i+1, len(pendingEntities))
+			logBlockDebug(blockNumber, "Entity %d/%d has empty payload", i+1, len(pendingCreates))
 		}
 
 		// Add create operation to the block
@@ -282,6 +287,64 @@ func processBlock() {
 		block.Operations = append(block.Operations, createOp)
 	}
 
+	// Then add UPDATE events (at the end, after creates)
+	logBlockDebug(blockNumber, "Creating UPDATE events for %d entities...", len(pendingUpdates))
+	for j, pendingEntity := range pendingUpdates {
+		entity := &pendingEntity.Entity
+		entity.CreatedAtBlock = blockNumber
+		entity.LastModifiedAtBlock = blockNumber
+
+		entityKey := []byte(entity.Key)
+		var payload []byte
+		if len(entity.Payload) > 0 {
+			payload = entity.Payload
+		}
+
+		keyHash := sha256.Sum256(entityKey)
+		keyHashHex := common.Hash(keyHash).Hex()
+
+		var ownerAddr common.Address
+		if entity.OwnerAddress != "" {
+			ownerAddr = common.HexToAddress(entity.OwnerAddress)
+		}
+
+		stringAttrs := make(map[string]string)
+		if entity.StringAnnotations != nil {
+			stringAttrs = entity.StringAnnotations
+		}
+
+		numericAttrs := make(map[string]uint64)
+		if entity.NumericAnnotations != nil {
+			for k, v := range entity.NumericAnnotations {
+				numericAttrs[k] = uint64(v)
+			}
+		}
+
+		opNum := len(pendingCreates) + j
+		txIndex := uint64(opNum / 10)
+		opIndex := uint64(opNum % 10)
+
+		btl := uint64(entity.ExpiresAt - entity.LastModifiedAtBlock)
+
+		logBlockDebug(blockNumber, "UPDATE %d/%d: key=%s, payloadSize=%d, contentType=%s, owner=%s, btl=%d, txIndex=%d, opIndex=%d",
+			j+1, len(pendingUpdates), keyHashHex, len(payload), entity.ContentType, ownerAddr.Hex(), btl, txIndex, opIndex)
+
+		updateOp := events.Operation{
+			TxIndex: txIndex,
+			OpIndex: opIndex,
+			Update: &events.OPUpdate{
+				Key:               common.Hash(keyHash),
+				ContentType:       entity.ContentType,
+				BTL:               btl,
+				Owner:             ownerAddr,
+				Content:           payload,
+				StringAttributes:  stringAttrs,
+				NumericAttributes: numericAttrs,
+			},
+		}
+		block.Operations = append(block.Operations, updateOp)
+	}
+
 	// Get expired entity key hashes and create delete operations
 	logBlockDebug(blockNumber, "Querying for expired entities (expiration <= %d)...", blockNumber)
 	expiredEntityKeyHashes, err := GetExpiredEntities(blockNumber)
@@ -290,7 +353,7 @@ func processBlock() {
 	} else {
 		logBlockInfoMsg(blockNumber, "Found %d expired entities to delete", len(expiredEntityKeyHashes))
 
-		// Start operation index after all create operations
+		// Start operation index after all create + update operations
 		startOpIndex := len(block.Operations)
 
 		for i, keyHash := range expiredEntityKeyHashes {
@@ -324,6 +387,7 @@ func processBlock() {
 	totalStringAttrs := 0
 	totalNumericAttrs := 0
 	createCount := 0
+	updateCount := 0
 	deleteCount := 0
 	for _, op := range block.Operations {
 		if op.Create != nil {
@@ -332,12 +396,18 @@ func processBlock() {
 			totalNumericAttrs += len(op.Create.NumericAttributes)
 			createCount++
 		}
+		if op.Update != nil {
+			totalPayloadSize += len(op.Update.Content)
+			totalStringAttrs += len(op.Update.StringAttributes)
+			totalNumericAttrs += len(op.Update.NumericAttributes)
+			updateCount++
+		}
 		if op.Delete != nil {
 			deleteCount++
 		}
 	}
-	logBlockDebug(blockNumber, "Created %d total operations (%d creates, %d deletes)",
-		len(block.Operations), createCount, deleteCount)
+	logBlockDebug(blockNumber, "Created %d total operations (%d creates, %d updates, %d deletes)",
+		len(block.Operations), createCount, updateCount, deleteCount)
 	logBlockDebug(blockNumber, "Block summary: totalPayloadSize=%d bytes, totalStringAttrs=%d, totalNumericAttrs=%d",
 		totalPayloadSize, totalStringAttrs, totalNumericAttrs)
 
@@ -407,8 +477,8 @@ func processBlock() {
 	logBlockInfoMsg(blockNumber, "Block batch pushed to iterator, FollowEvents will process it")
 
 	totalDuration := time.Since(totalStartTime)
-	logBlockInfoMsg(blockNumber, "Processed %d operations (%d creates, %d deletes) - %.2fms",
-		len(block.Operations), createCount, deleteCount, totalDuration.Seconds()*1000)
+	logBlockInfoMsg(blockNumber, "Processed %d operations (%d creates, %d updates, %d deletes) - %.2fms",
+		len(block.Operations), createCount, updateCount, deleteCount, totalDuration.Seconds()*1000)
 
 	// Log to processing.log
 	logToProcessingLog(
@@ -416,7 +486,7 @@ func processBlock() {
 			testName,
 			blockNumber,
 			int(totalDuration.Milliseconds()),
-			len(pendingEntities),
+			totalPending,
 			stringCount,
 			numericCount,
 		),

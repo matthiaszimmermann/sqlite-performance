@@ -290,6 +290,17 @@ class DataCenterWriteAndUpdateUser(FastHttpUser):
             else:
                 resp.failure(f"Unexpected status: {resp.status_code}")
 
+    def _put_entity_update(self, key: str, patch: Dict[str, Any], name: str) -> None:
+        # Server-side UpdateRequest expects full entity data. We allow callers to pass
+        # a full create-like request and strip the key (key comes from URL path).
+        body = dict(patch)
+        body.pop("key", None)
+        with self.client.put(f"/entities/{key}", json=body, catch_response=True, name=name) as resp:
+            if resp.status_code == 202:
+                resp.success()
+            else:
+                resp.failure(f"Unexpected status: {resp.status_code}")
+
     # -------------------------------------------------------------------------
     # Tasks (frequency: add_node < update_node < add_workload < update_workload)
     # -------------------------------------------------------------------------
@@ -324,7 +335,14 @@ class DataCenterWriteAndUpdateUser(FastHttpUser):
         new_status = self._sample_node_status_for_update(node.status)
         updated = replace(node, status=new_status, block=self.current_block)
 
-        self._post_entity(node_to_entity_request(updated, self.creator_address), name="update_node")
+        key_hex = "0x" + updated.entity_key.hex()
+        # Update existing entity by key (send full UpdateRequest payload).
+        req = node_to_entity_request(updated, self.creator_address)
+        self._put_entity_update(
+            key_hex,
+            patch=req,
+            name="update_node",
+        )
 
         # Persist the latest version in the pool (by replacement in-place)
         try:
@@ -382,8 +400,13 @@ class DataCenterWriteAndUpdateUser(FastHttpUser):
             block=self.current_block,
         )
 
-        self._post_entity(
-            workload_to_entity_request(updated, self.creator_address), name="update_workload"
+        key_hex = "0x" + updated.entity_key.hex()
+        # Update existing entity by key (send full UpdateRequest payload).
+        req = workload_to_entity_request(updated, self.creator_address)
+        self._put_entity_update(
+            key_hex,
+            patch=req,
+            name="update_workload",
         )
 
         # Persist the latest version in the pool (by replacement in-place)

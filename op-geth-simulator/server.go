@@ -39,6 +39,9 @@ func StartServer(port int, dbPath string, testname string) error {
 	// Get entity by key endpoint
 	r.HandleFunc("/entities/{key}", getEntityHandler).Methods("GET")
 
+	// Update entity by key endpoint (partial update via merge + enqueue)
+	r.HandleFunc("/entities/{key}", updateEntityHandler).Methods("PUT", "PATCH")
+
 	// Query entities endpoint
 	r.HandleFunc("/entities/query", queryEntitiesHandler).Methods("POST")
 
@@ -133,7 +136,7 @@ func writeEntityHandler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Queue size before: %d\n", timestamp, queueSizeBefore)
 
-	var request EntityWriteRequest
+	var request EntityCreateRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Invalid JSON: %v\n", time.Now().Format(time.RFC3339), err)
 		jsonError(w, http.StatusBadRequest, "Invalid JSON")
@@ -165,11 +168,68 @@ func writeEntityHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enqueue the entity
-	id := writeQueue.Enqueue(&request)
+	id := writeQueue.EnqueueCreate(&request)
 	queueSizeAfter := writeQueue.GetQueueSize()
 
 	fmt.Printf("[%s] [DEBUG] [HTTP] POST /entities - Entity enqueued with ID: %s, Queue size after: %d (delta: %d)\n",
 		time.Now().Format(time.RFC3339), id, queueSizeAfter, queueSizeAfter-queueSizeBefore)
+
+	response := map[string]interface{}{
+		"success":   true,
+		"id":        id,
+		"message":   "Entity queued for processing",
+		"queueSize": queueSizeAfter,
+	}
+
+	jsonResponse(w, http.StatusAccepted, response)
+}
+
+// updateEntityHandler handles entity update requests by key.
+// Updates are enqueued as OPUpdate operations (and will be emitted after creates in the same block).
+func updateEntityHandler(w http.ResponseWriter, r *http.Request) {
+	timestamp := time.Now().Format(time.RFC3339)
+	vars := mux.Vars(r)
+	key := vars["key"]
+
+	queueSizeBefore := writeQueue.GetQueueSize()
+	fmt.Printf("[%s] [DEBUG] [HTTP] %s /entities/{key} - Key: %s - Queue size before: %d\n",
+		timestamp, r.Method, key, queueSizeBefore)
+
+	if key == "" {
+		fmt.Printf("[%s] [DEBUG] [HTTP] %s /entities/{key} - Missing key parameter\n",
+			time.Now().Format(time.RFC3339), r.Method)
+		jsonError(w, http.StatusBadRequest, "Key parameter is required")
+		return
+	}
+
+	var request EntityUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		fmt.Printf("[%s] [DEBUG] [HTTP] %s /entities/{key} - Invalid JSON: %v\n",
+			time.Now().Format(time.RFC3339), r.Method, err)
+		jsonError(w, http.StatusBadRequest, "Invalid JSON")
+		return
+	}
+
+	// Key comes from the URL and overrides any body key.
+	request.Key = key
+
+	// Validate required fields (same as create).
+	if request.ContentType == "" || request.OwnerAddress == "" {
+		jsonError(w, http.StatusBadRequest, "Missing required fields: contentType, ownerAddress")
+		return
+	}
+
+	if request.ExpiresIn <= 0 {
+		jsonError(w, http.StatusBadRequest, "expiresIn must be a positive number")
+		return
+	}
+
+	// Enqueue as an UPDATE operation.
+	id := writeQueue.EnqueueUpdate(&request)
+	queueSizeAfter := writeQueue.GetQueueSize()
+
+	fmt.Printf("[%s] [DEBUG] [HTTP] %s /entities/{key} - Entity enqueued with ID: %s, Queue size after: %d (delta: %d)\n",
+		time.Now().Format(time.RFC3339), r.Method, id, queueSizeAfter, queueSizeAfter-queueSizeBefore)
 
 	response := map[string]interface{}{
 		"success":   true,
@@ -347,11 +407,11 @@ func entityToResponse(entity *Entity) map[string]interface{} {
 	}
 
 	// Add annotations if present
-	if entity.StringAnnotations != nil && len(entity.StringAnnotations) > 0 {
+	if len(entity.StringAnnotations) > 0 {
 		response["stringAnnotations"] = entity.StringAnnotations
 	}
 
-	if entity.NumericAnnotations != nil && len(entity.NumericAnnotations) > 0 {
+	if len(entity.NumericAnnotations) > 0 {
 		response["numericAnnotations"] = entity.NumericAnnotations
 	}
 

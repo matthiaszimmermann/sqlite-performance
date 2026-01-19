@@ -24,6 +24,18 @@ export interface EntityWriteRequest {
   numericAnnotations?: Record<string, number>;
 }
 
+// Partial update to an existing entity. Only provided fields are applied.
+// Implemented by enqueueing a new write for the same key with merged fields.
+export interface EntityUpdateRequest {
+  expiresIn?: number; // Number of blocks from current block until expiration
+  payload?: string; // base64 encoded or plain string
+  contentType?: string;
+  deleted?: boolean;
+  ownerAddress?: string;
+  stringAnnotations?: Record<string, string>;
+  numericAnnotations?: Record<string, number>;
+}
+
 export interface EntityQueryRequest {
   stringAnnotations?: Record<string, string>;
   numericAnnotations?: Record<string, number | string>; // number for equality, string for range (e.g., ">=8", "<=32", ">16", "<64", "!=0")

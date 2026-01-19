@@ -119,8 +119,8 @@ func addEntities(count, numAttributes int, maxSizeKB float64) error {
 			numericAnnotationsInterface[k] = v
 		}
 
-		// Create write request
-		request := EntityWriteRequest{
+		// Create request
+		request := EntityCreateRequest{
 			Key:                fmt.Sprintf("cli-entity-%d-%d-%s", time.Now().UnixNano(), i, randomString(7)),
 			ExpiresIn:          int64(randomInt(3600, 86400*7)), // 1 hour to 7 days in blocks
 			Payload:            base64.StdEncoding.EncodeToString(payload),
@@ -175,7 +175,7 @@ func checkServerHealth(serverURL string) error {
 }
 
 // sendAddEntityRequest sends an HTTP POST request to add an entity
-func sendAddEntityRequest(serverURL string, request EntityWriteRequest) error {
+func sendAddEntityRequest(serverURL string, request EntityCreateRequest) error {
 	jsonData, err := json.Marshal(request)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)

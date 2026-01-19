@@ -12,7 +12,7 @@ import {
 } from "./db.js"
 import { logRequestWarning } from "./logger.js"
 import { writeQueue } from "./queue.js"
-import type { EntityQueryRequest, EntityWriteRequest } from "./types.js"
+import type { EntityQueryRequest, EntityUpdateRequest, EntityWriteRequest } from "./types.js"
 
 // Parse command-line arguments for DB path
 function parseDbPath(): string | undefined {
@@ -159,6 +159,98 @@ app.get("/entities/:key", (c) => {
     console.error("Error in get entity endpoint:", error)
     return c.json({ error: "Internal server error" }, 500)
   }
+})
+
+// 2b. Update entity by key endpoint (partial update via merge + enqueue)
+async function handleEntityUpdate(c: any) {
+  try {
+    const key = c.req.param("key")
+    if (!key) {
+      return c.json({ error: "Key parameter is required" }, 400)
+    }
+
+    const existing = getEntityByKey(key)
+    if (!existing) {
+      return c.json({ error: "Entity not found" }, 404)
+    }
+
+    const patch = (await c.req.json()) as EntityUpdateRequest
+
+    const ownerAddress = patch.ownerAddress ?? existing.ownerAddress
+    if (!ownerAddress) {
+      return c.json({ error: "Missing required field: ownerAddress" }, 400)
+    }
+
+    const contentType = patch.contentType ?? existing.contentType
+    if (!contentType) {
+      return c.json({ error: "Missing required field: contentType" }, 400)
+    }
+
+    // expiresIn defaults to remaining TTL (min 1)
+    const currentBlock = writeQueue.getCurrentBlockNumber()
+    const remaining = Math.max(1, (existing.expiresAt ?? 0) - currentBlock)
+    const expiresIn = patch.expiresIn ?? remaining
+    if (expiresIn <= 0) {
+      return c.json({ error: "expiresIn must be a positive number" }, 400)
+    }
+
+    // payload defaults to existing payload (base64) if not provided
+    let payload: string | undefined
+    if (patch.payload !== undefined) {
+      payload = patch.payload
+    } else if (existing.payload instanceof Buffer) {
+      payload = existing.payload.toString("base64")
+    }
+
+    const mergedStringAnnotations: Record<string, string> = {
+      ...(existing.stringAnnotations ?? {}),
+      ...(patch.stringAnnotations ?? {}),
+      $creator: ownerAddress,
+      $owner: ownerAddress,
+      $key: key,
+    }
+
+    const mergedNumericAnnotations: Record<string, number> = {
+      ...(existing.numericAnnotations ?? {}),
+      ...(patch.numericAnnotations ?? {}),
+      $expiration: currentBlock + expiresIn,
+      $createdAtBlock: currentBlock,
+      $txIndex: 0,
+      $opIndex: 0,
+      $sequence: 0,
+    }
+
+    const req: EntityWriteRequest = {
+      key,
+      expiresIn,
+      payload,
+      contentType,
+      deleted: patch.deleted ?? false,
+      ownerAddress,
+      stringAnnotations: mergedStringAnnotations,
+      numericAnnotations: mergedNumericAnnotations,
+    }
+
+    const id = writeQueue.enqueue(req)
+    return c.json(
+      {
+        success: true,
+        id,
+        message: "Entity queued for processing",
+        queueSize: writeQueue.getQueueSize(),
+      },
+      202,
+    )
+  } catch (error) {
+    console.error("Error in update entity endpoint:", error)
+    return c.json({ error: "Internal server error" }, 500)
+  }
+}
+
+app.put("/entities/:key", handleEntityUpdate)
+
+app.patch("/entities/:key", async (c) => {
+  return handleEntityUpdate(c)
 })
 
 // 3. Query entities by attributes endpoint
