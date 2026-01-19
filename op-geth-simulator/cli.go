@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
@@ -9,10 +10,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	mathrand "math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -386,6 +390,177 @@ func countEntities() error {
 	return nil
 }
 
+type BatchMetrics struct {
+	FromBlock        int64
+	ToBlock          int64
+	CreateOps        int64
+	UpdateOps        int64
+	DeleteOps        int64
+	ExtendOps        int64
+	OwnerChangeOps   int64
+	TotalOps         int64
+	ProcessingTimeMS int64
+}
+
+func parseBlockBatchLine(line string) (testName string, m BatchMetrics, ok bool) {
+	// Expected format:
+	// [timestamp] <testname> BLOCK-BATCH <start> <end> <creates> <updates> <deletes> <extends> <ownerChanges> <totalOps> <processingTime>
+	fields := strings.Fields(line)
+	if len(fields) < 12 {
+		return "", BatchMetrics{}, false
+	}
+	if fields[2] != "BLOCK-BATCH" {
+		return "", BatchMetrics{}, false
+	}
+
+	testName = fields[1]
+	nums := fields[3:]
+	if len(nums) < 9 {
+		return "", BatchMetrics{}, false
+	}
+
+	values := make([]int64, 9)
+	for i := 0; i < 9; i++ {
+		v, err := strconv.ParseInt(nums[i], 10, 64)
+		if err != nil {
+			return "", BatchMetrics{}, false
+		}
+		values[i] = v
+	}
+
+	m = BatchMetrics{
+		FromBlock:        values[0],
+		ToBlock:          values[1],
+		CreateOps:        values[2],
+		UpdateOps:        values[3],
+		DeleteOps:        values[4],
+		ExtendOps:        values[5],
+		OwnerChangeOps:   values[6],
+		TotalOps:         values[7],
+		ProcessingTimeMS: values[8],
+	}
+	return testName, m, true
+}
+
+func percentileNearestRank(sorted []int64, p float64) int64 {
+	// Nearest-rank definition: k = ceil(p*n), 1-indexed; return sorted[k-1]
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[n-1]
+	}
+	k := int(math.Ceil(p * float64(n)))
+	if k < 1 {
+		k = 1
+	}
+	if k > n {
+		k = n
+	}
+	return sorted[k-1]
+}
+
+func processLogFile(testName, filePath string) error {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to open %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	var times []int64
+	var totalOpsSum int64
+	var blocks int64
+
+	var minTime int64 = math.MaxInt64
+	var maxTime int64 = 0
+
+	sc := bufio.NewScanner(f)
+	// Some log lines can get large; raise scanner buffer.
+	buf := make([]byte, 0, 1024*1024)
+	sc.Buffer(buf, 16*1024*1024)
+
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.Contains(line, " BLOCK-BATCH ") {
+			continue
+		}
+		tn, m, ok := parseBlockBatchLine(line)
+		if !ok {
+			continue
+		}
+		if tn != testName {
+			continue
+		}
+
+		blocks++
+		totalOpsSum += m.TotalOps
+		times = append(times, m.ProcessingTimeMS)
+		if m.ProcessingTimeMS < minTime {
+			minTime = m.ProcessingTimeMS
+		}
+		if m.ProcessingTimeMS > maxTime {
+			maxTime = m.ProcessingTimeMS
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("failed reading %s: %w", filePath, err)
+	}
+	if blocks == 0 {
+		return fmt.Errorf("no matching BLOCK-BATCH lines found for test %q in %s", testName, filePath)
+	}
+
+	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	avgOps := float64(totalOpsSum) / float64(blocks)
+
+	p50 := percentileNearestRank(times, 0.50)
+	p80 := percentileNearestRank(times, 0.80)
+	p90 := percentileNearestRank(times, 0.90)
+	p95 := percentileNearestRank(times, 0.95)
+	p99 := percentileNearestRank(times, 0.99)
+
+	fmt.Printf("Processing log summary\n")
+	fmt.Printf("  Test name: %s\n", testName)
+	fmt.Printf("  File: %s\n", filePath)
+	fmt.Printf("  Blocks (BLOCK-BATCH lines): %d\n", blocks)
+	fmt.Printf("  Avg total ops per block: %.2f\n", avgOps)
+	fmt.Printf("  Time (ms): min=%d max=%d\n", minTime, maxTime)
+	fmt.Printf("  Time percentiles (ms): p50=%d p80=%d p90=%d p95=%d p99=%d\n", p50, p80, p90, p95, p99)
+	return nil
+}
+
+func parseProcessLogArgs(args []string) (testName string, filePath string, err error) {
+	filePath = "processing.log"
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--file":
+			if i+1 >= len(args) {
+				return "", "", fmt.Errorf("--file requires a path")
+			}
+			filePath = args[i+1]
+			i++
+		case "help", "--help", "-h":
+			return "", "", fmt.Errorf("help")
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", "", fmt.Errorf("unknown argument: %s", arg)
+			}
+			if testName != "" {
+				return "", "", fmt.Errorf("unexpected extra argument: %s", arg)
+			}
+			testName = arg
+		}
+	}
+	if testName == "" {
+		return "", "", fmt.Errorf("missing test name")
+	}
+	return testName, filePath, nil
+}
+
 // printUsage prints CLI usage information
 func printUsage() {
 	fmt.Println(`
@@ -398,6 +573,7 @@ Commands:
   get <key>                             Get a single entity by key via HTTP
   count                                 Get total entity count via HTTP
   clean                                 Clean all data via HTTP
+  process-log <testname> [--file <path>]  Summarize processing.log BLOCK-BATCH lines for a test
 
 Arguments for add:
   count                                 Number of entities to add
@@ -426,6 +602,7 @@ Examples:
   go run . cli get cli-entity-123        Get entity by key
   go run . cli count                     Get total entity count
   go run . cli clean                     Clean all data
+  go run . cli process-log bitmap-test-9 --file processing.log
 
 Environment variables:
   SERVER_URL                            Server URL (default: http://localhost:3000)
@@ -598,6 +775,19 @@ func RunCLI() {
 
 	case "clean":
 		if err := cleanDatabase(); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+
+	case "process-log":
+		testName, filePath, err := parseProcessLogArgs(commandArgs)
+		if err != nil {
+			printUsage()
+			if err.Error() != "help" {
+				log.Fatalf("Error: %v", err)
+			}
+			os.Exit(0)
+		}
+		if err := processLogFile(testName, filePath); err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 
