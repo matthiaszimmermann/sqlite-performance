@@ -310,10 +310,9 @@ func GetCurrentBlockNumber() int64 {
 	}
 
 	ctx := context.Background()
-	queries := s.NewQueries()
 
 	// Use NewQueries.GetLastBlock to get current block number
-	block, err := queries.GetLastBlock(ctx)
+	block, err := s.GetLastBlock(ctx)
 	if err != nil {
 		return 1
 	}
