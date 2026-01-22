@@ -4,7 +4,7 @@ go 1.25.4
 
 require (
 	github.com/Arkiv-Network/arkiv-events v0.0.4
-	github.com/Arkiv-Network/sqlite-bitmap-store v0.0.15
+	github.com/Arkiv-Network/sqlite-bitmap-store v0.0.17
 	github.com/ethereum/go-ethereum v1.16.7
 	github.com/gorilla/mux v1.8.1
 	github.com/mattn/go-sqlite3 v1.14.33

@@ -1,7 +1,7 @@
 github.com/Arkiv-Network/arkiv-events v0.0.4 h1:8WWhhVMHIkBIn1fAst/qH4Sl3KBVvrErQkkZ2Rd6gk4=
 github.com/Arkiv-Network/arkiv-events v0.0.4/go.mod h1:LaYW4FqA95Rhp/SKTAF8+FEK7cazJDRBXPXl7I90NRc=
-github.com/Arkiv-Network/sqlite-bitmap-store v0.0.15 h1:CSDXcM7IzHTsPeCOuIBM/XWX4xI0w/W6wxqnMWv1yNE=
-github.com/Arkiv-Network/sqlite-bitmap-store v0.0.15/go.mod h1:P4vElNNh/nAnzoyMK+icUhT9LtrJp34PivG1JqXBmUM=
+github.com/Arkiv-Network/sqlite-bitmap-store v0.0.17 h1:q4MQDHpZPzW+anJoJhpz4cTFOfgOmFC1u5zFYYEixss=
+github.com/Arkiv-Network/sqlite-bitmap-store v0.0.17/go.mod h1:P4vElNNh/nAnzoyMK+icUhT9LtrJp34PivG1JqXBmUM=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/RoaringBitmap/roaring/v2 v2.14.4 h1:4aKySrrg9G/5oRtJ3TrZLObVqxgQ9f1znCRBwEwjuVw=
