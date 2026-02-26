@@ -100,7 +100,7 @@ async function addEntities(
 
   // Initialize database
   console.log(`Connecting to database: ${DB_PATH}`)
-  initDatabase(DB_PATH)
+  await initDatabase(DB_PATH)
 
   const now = Math.floor(Date.now() / 1000)
   const startTime = Date.now()
@@ -152,7 +152,7 @@ async function addEntities(
     // Insert batch when we reach BATCH_SIZE or at the end
     if (entities.length >= BATCH_SIZE || i === count - 1) {
       try {
-        insertEntitiesBatch(entities)
+        await insertEntitiesBatch(entities)
         const progress = ((i + 1) / count) * 100
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1)
         process.stdout.write(
@@ -183,14 +183,14 @@ async function clean(): Promise<void> {
 
   // Initialize database
   console.log(`Connecting to database: ${DB_PATH}`)
-  initDatabase(DB_PATH)
+  await initDatabase(DB_PATH)
 
   try {
-    cleanAllData()
+    await cleanAllData()
     console.log("✓ All data has been cleaned from the database.")
 
     console.log("Running VACUUM to reclaim unused space...")
-    vacuumDatabase()
+    await vacuumDatabase()
     console.log("✓ Database vacuumed successfully.")
   } catch (error) {
     console.error("✗ Failed to clean data:", error)
@@ -286,22 +286,19 @@ async function main(): Promise<void> {
 // Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\nShutting down...")
-  closeDatabase()
-  process.exit(0)
+  void closeDatabase().finally(() => process.exit(0))
 })
 
 process.on("SIGTERM", () => {
   console.log("\nShutting down...")
-  closeDatabase()
-  process.exit(0)
+  void closeDatabase().finally(() => process.exit(0))
 })
 
 main()
   .then(() => {
-    closeDatabase()
+    return closeDatabase()
   })
   .catch((error) => {
     console.error("Fatal error:", error)
-    closeDatabase()
-    process.exit(1)
+    void closeDatabase().finally(() => process.exit(1))
   })

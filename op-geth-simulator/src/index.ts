@@ -46,24 +46,22 @@ const dbPath = parseDbPath()
 const testName = parseTestName()
 
 // Initialize database
-initDatabase(dbPath)
+await initDatabase(dbPath)
 
 // Start block processor
-startBlockProcessor(testName)
+await startBlockProcessor(testName)
 
 // Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\nShutting down...")
   stopBlockProcessor()
-  closeDatabase()
-  process.exit(0)
+  void closeDatabase().finally(() => process.exit(0))
 })
 
 process.on("SIGTERM", () => {
   console.log("\nShutting down...")
   stopBlockProcessor()
-  closeDatabase()
-  process.exit(0)
+  void closeDatabase().finally(() => process.exit(0))
 })
 
 const app = new Hono()
@@ -133,7 +131,7 @@ app.post("/entities", async (c) => {
 })
 
 // 2. Get entity by key endpoint
-app.get("/entities/:key", (c) => {
+app.get("/entities/:key", async (c) => {
   try {
     const key = c.req.param("key")
 
@@ -141,7 +139,7 @@ app.get("/entities/:key", (c) => {
       return c.json({ error: "Key parameter is required" }, 400)
     }
 
-    const entity = getEntityByKey(key)
+    const entity = await getEntityByKey(key)
 
     if (!entity) {
       return c.json({ error: "Entity not found" }, 404)
@@ -169,7 +167,7 @@ async function handleEntityUpdate(c: any) {
       return c.json({ error: "Key parameter is required" }, 400)
     }
 
-    const existing = getEntityByKey(key)
+    const existing = await getEntityByKey(key)
     if (!existing) {
       return c.json({ error: "Entity not found" }, 404)
     }
@@ -284,9 +282,9 @@ app.post("/entities/query", async (c) => {
 })
 
 // 4. Count all entities endpoint
-app.get("/entities/count", (c) => {
+app.get("/entities/count", async (c) => {
   try {
-    const count = countEntities()
+    const count = await countEntities()
     return c.json({ count })
   } catch (error) {
     console.error("Error in count entities endpoint:", error)
@@ -295,9 +293,9 @@ app.get("/entities/count", (c) => {
 })
 
 // 5. Clean all data endpoint
-app.delete("/entities/clean", (c) => {
+app.delete("/entities/clean", async (c) => {
   try {
-    cleanAllData()
+    await cleanAllData()
     return c.json({ success: true, message: "All data cleaned" })
   } catch (error) {
     console.error("Error in clean all data endpoint:", error)
@@ -306,7 +304,7 @@ app.delete("/entities/clean", (c) => {
 })
 
 // 6. Get receipt endpoint - check if entity was saved to DB (like Ethereum's getReceipt)
-app.get("/receipt/:id", (c) => {
+app.get("/receipt/:id", async (c) => {
   try {
     const id = c.req.param("id")
 
@@ -315,7 +313,7 @@ app.get("/receipt/:id", (c) => {
     }
 
     // Query receipt directly from database (no queue lookup)
-    const receipt = getReceiptById(id)
+    const receipt = await getReceiptById(id)
 
     if (!receipt) {
       return c.json({ error: "Receipt not found" }, 404)

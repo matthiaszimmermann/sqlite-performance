@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Database } from "bun:sqlite"
+import { createPool, type Pool, type PoolConnection } from "mysql2/promise"
 import { logQueryWarning, logQuery } from "./logger.js"
 import type { Entity, PendingEntity } from "./types.js"
 
@@ -9,11 +10,35 @@ import type { Entity, PendingEntity } from "./types.js"
 const DEFAULT_POOL_SIZE = 4 // Number of read connections
 let poolSize = DEFAULT_POOL_SIZE
 
-// Connection pool
-let readPool: Database[] = []
-let writeDb: Database | null = null
+type DbEngine = "sqlite" | "mysql"
+const dbEngine: DbEngine = (process.env.DB_ENGINE || "sqlite").toLowerCase() === "mysql" ? "mysql" : "sqlite"
+
+// SQLite connection pool
+let sqliteReadPool: Database[] = []
+let sqliteWriteDb: Database | null = null
+
+// MySQL pool
+let mysqlPool: Pool | null = null
+
 let poolInitialized = false
 let currentReadIndex = 0
+
+async function ensureLastBlockInitialized(conn?: PoolConnection): Promise<void> {
+  if (dbEngine === "sqlite") {
+    if (!sqliteWriteDb) {
+      throw new Error("SQLite DB not initialized. Call initDatabase() first.")
+    }
+    sqliteWriteDb.prepare("INSERT OR IGNORE INTO last_block (id, block) VALUES (1, 0)").run()
+    return
+  }
+
+  if (!mysqlPool) {
+    throw new Error("MySQL pool not initialized. Call initDatabase() first.")
+  }
+
+  const runner = conn ?? mysqlPool
+  await runner.execute("INSERT IGNORE INTO last_block (id, block) VALUES (1, 0)")
+}
 
 function logDbOperation(operation: string, duration: number): void {
   const message = `[DB] ${operation} - ${duration.toFixed(2)}ms`
@@ -25,92 +50,173 @@ function logDbOperation(operation: string, duration: number): void {
   }
 }
 
-export function initDatabase(
+export async function initDatabase(
   dbPath: string = "op-geth-sim.db",
   poolSizeOverride?: number,
-): Database {
-  if (poolInitialized && writeDb) {
-    return writeDb
+): Promise<void> {
+  if (poolInitialized) {
+    return
   }
 
-  
   if (poolSizeOverride !== undefined) {
     poolSize = poolSizeOverride
   }
 
-  // Read and execute schema - find schema.sql relative to this file
-  const __filename = fileURLToPath(import.meta.url)
-  const __dirname = dirname(__filename)
-  const schemaPath = join(__dirname, "../../", "arkiv.schema.sql")
-  const schema = `${readFileSync(schemaPath, "utf-8")}\n
-  CREATE TABLE IF NOT EXISTS entity_receipts (
-    id TEXT NOT NULL PRIMARY KEY,
-    entity_key TEXT NOT NULL,
-    created_at_block INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_entity_receipts_id ON entity_receipts(id);
-  `
+  if (dbEngine === "sqlite") {
+    // Read and execute schema - find schema.sql relative to this file
+    const __filename = fileURLToPath(import.meta.url)
+    const __dirname = dirname(__filename)
+    const schemaPath = join(__dirname, "../../", "arkiv.schema.sql")
+    const schema = `${readFileSync(schemaPath, "utf-8")}\n
+    CREATE TABLE IF NOT EXISTS entity_receipts (
+      id TEXT NOT NULL PRIMARY KEY,
+      entity_key TEXT NOT NULL,
+      created_at_block INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_entity_receipts_id ON entity_receipts(id);
+    `
 
-  // Initialize write connection (single connection for writes)
-  // mode=rwc (read-write-create, default for write connections)
-  writeDb = new Database(dbPath)
+    // Initialize write connection (single connection for writes)
+    // mode=rwc (read-write-create, default for write connections)
+    sqliteWriteDb = new Database(dbPath)
 
-  // Set pragmas for write connection
-  writeDb.run("PRAGMA journal_mode = WAL") // _journal_mode=WAL
-  writeDb.run("PRAGMA busy_timeout = 11000") // _busy_timeout=11000 (11 seconds)
-  writeDb.run("PRAGMA auto_vacuum = incremental") // _auto_vacuum=incremental
-  writeDb.run("PRAGMA foreign_keys = OFF") // _foreign_keys=true
-  writeDb.run("PRAGMA cache_size = 100000") // _cache_size=1000000000 (in pages)
-  // Note: _txlock=immediate - transactions will use BEGIN IMMEDIATE for immediate locking
+    // Set pragmas for write connection
+    sqliteWriteDb.run("PRAGMA journal_mode = WAL") // _journal_mode=WAL
+    sqliteWriteDb.run("PRAGMA busy_timeout = 11000") // _busy_timeout=11000 (11 seconds)
+    sqliteWriteDb.run("PRAGMA auto_vacuum = incremental") // _auto_vacuum=incremental
+    sqliteWriteDb.run("PRAGMA foreign_keys = OFF") // _foreign_keys=true
+    sqliteWriteDb.run("PRAGMA cache_size = 100000") // _cache_size=1000000000 (in pages)
+    // Note: _txlock=immediate - transactions will use BEGIN IMMEDIATE for immediate locking
 
-  writeDb.run(schema)
+    sqliteWriteDb.run(schema)
+    await ensureLastBlockInitialized()
 
-  // Initialize read pool (multiple connections for concurrent reads)
-  readPool = []
-  for (let i = 0; i < poolSize; i++) {
-    // Configure read connections with optimized settings
-    // bun:sqlite doesn't support readonly option in constructor, we'll use pragma instead
-    const readDb = new Database(dbPath)
+    // Initialize read pool (multiple connections for concurrent reads)
+    sqliteReadPool = []
+    for (let i = 0; i < poolSize; i++) {
+      // Configure read connections with optimized settings
+      // bun:sqlite doesn't support readonly option in constructor, we'll use pragma instead
+      const readDb = new Database(dbPath)
 
-    // Set pragmas for read connections
-    readDb.run("PRAGMA journal_mode = WAL") // _journal_mode=WAL
-    readDb.run("PRAGMA busy_timeout = 11000") // _busy_timeout=11000 (11 seconds)
-    readDb.run("PRAGMA auto_vacuum = incremental") // _auto_vacuum=incremental
-    readDb.run("PRAGMA foreign_keys = OFF") // _foreign_keys=true
-    readDb.run("PRAGMA cache_size = 100000") // _cache_size=1000000000 (in pages)
-    // Note: _txlock=deferred is the default transaction locking mode in SQLite
+      // Set pragmas for read connections
+      readDb.run("PRAGMA journal_mode = WAL") // _journal_mode=WAL
+      readDb.run("PRAGMA busy_timeout = 11000") // _busy_timeout=11000 (11 seconds)
+      readDb.run("PRAGMA auto_vacuum = incremental") // _auto_vacuum=incremental
+      readDb.run("PRAGMA foreign_keys = OFF") // _foreign_keys=true
+      readDb.run("PRAGMA cache_size = 100000") // _cache_size=1000000000 (in pages)
+      // Note: _txlock=deferred is the default transaction locking mode in SQLite
 
-    readPool.push(readDb)
+      sqliteReadPool.push(readDb)
+    }
+
+    poolInitialized = true
+    console.log(
+      `Database initialized (engine=sqlite): ${poolSize} read connections, 1 write connection`,
+    )
+    return
   }
 
-  poolInitialized = true
-  console.log(`Database pool initialized: ${poolSize} read connections, 1 write connection`)
+  // MySQL
+  // Configure via MYSQL_URL or discrete env vars.
+  const mysqlUrl = process.env.MYSQL_URL
+  mysqlPool = mysqlUrl
+    ? createPool(mysqlUrl)
+    : createPool({
+        host: process.env.MYSQL_HOST || "127.0.0.1",
+        port: process.env.MYSQL_PORT ? Number(process.env.MYSQL_PORT) : 3306,
+        user: process.env.MYSQL_USER || "root",
+        password: process.env.MYSQL_PASSWORD || "",
+        database: process.env.MYSQL_DATABASE || "op_geth_sim",
+        connectionLimit: poolSizeOverride ?? poolSize,
+      })
 
-  return writeDb
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version BIGINT NOT NULL,
+      dirty BOOLEAN NOT NULL DEFAULT FALSE,
+      PRIMARY KEY (version)
+    )
+  `)
+
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS payloads (
+      entity_key VARBINARY(255) NOT NULL,
+      from_block BIGINT NOT NULL,
+      to_block BIGINT NOT NULL,
+      payload LONGBLOB NOT NULL,
+      content_type VARCHAR(255) NOT NULL,
+      string_attributes TEXT NOT NULL,
+      numeric_attributes TEXT NOT NULL,
+      PRIMARY KEY (entity_key, from_block)
+    )
+  `)
+
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS string_attributes (
+      entity_key VARBINARY(255) NOT NULL,
+      from_block BIGINT NOT NULL,
+      to_block BIGINT NOT NULL,
+      \`key\` VARCHAR(191) NOT NULL,
+      value TEXT NOT NULL,
+      PRIMARY KEY (entity_key, \`key\`, from_block)
+    )
+  `)
+
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS numeric_attributes (
+      entity_key VARBINARY(255) NOT NULL,
+      from_block BIGINT NOT NULL,
+      to_block BIGINT NOT NULL,
+      \`key\` VARCHAR(191) NOT NULL,
+      value BIGINT NOT NULL,
+      PRIMARY KEY (entity_key, \`key\`, from_block)
+    )
+  `)
+
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS last_block (
+      id TINYINT NOT NULL,
+      block BIGINT NOT NULL,
+      PRIMARY KEY (id)
+    )
+  `)
+
+  await mysqlPool.execute(`
+    CREATE TABLE IF NOT EXISTS entity_receipts (
+      id VARCHAR(255) NOT NULL PRIMARY KEY,
+      entity_key TEXT NOT NULL,
+      created_at_block BIGINT NOT NULL
+    )
+  `)
+
+  await ensureLastBlockInitialized()
+
+  poolInitialized = true
+  console.log(`Database initialized (engine=mysql): pool size ${poolSize}`)
 }
 
 /**
  * Get a read connection from the pool (round-robin)
  */
-function getReadConnection(): Database {
-  if (!poolInitialized || readPool.length === 0) {
-    throw new Error("Database pool not initialized. Call initDatabase() first.")
+function getSqliteReadConnection(): Database {
+  if (!poolInitialized || sqliteReadPool.length === 0) {
+    throw new Error("SQLite pool not initialized. Call initDatabase() first.")
   }
 
   // Round-robin selection
-  const connection = readPool[currentReadIndex]
-  currentReadIndex = (currentReadIndex + 1) % readPool.length
+  const connection = sqliteReadPool[currentReadIndex]
+  currentReadIndex = (currentReadIndex + 1) % sqliteReadPool.length
   return connection
 }
 
 /**
  * Get the write connection (single connection for all writes)
  */
-function getWriteConnection(): Database {
-  if (!poolInitialized || !writeDb) {
-    throw new Error("Database pool not initialized. Call initDatabase() first.")
+function getSqliteWriteConnection(): Database {
+  if (!sqliteWriteDb) {
+    throw new Error("SQLite DB not initialized. Call initDatabase() first.")
   }
-  return writeDb
+  return sqliteWriteDb
 }
 
 /**
@@ -135,37 +241,128 @@ function immediateTransaction<T>(database: Database, fn: () => T): T {
  * @deprecated Use getReadConnection() or getWriteConnection() instead
  */
 export function getDatabase(): Database {
-  return getReadConnection()
+  if (dbEngine !== "sqlite") {
+    throw new Error("getDatabase() is only available for SQLite engine")
+  }
+  return getSqliteReadConnection()
 }
 
-export function closeDatabase(): void {
-  // Close all read connections
-  for (const db of readPool) {
-    try {
-      db.close()
-    } catch (error) {
-      console.error("Error closing read connection:", error)
+export async function closeDatabase(): Promise<void> {
+  if (dbEngine === "sqlite") {
+    // Close all read connections
+    for (const db of sqliteReadPool) {
+      try {
+        db.close()
+      } catch (error) {
+        console.error("Error closing read connection:", error)
+      }
     }
-  }
-  readPool = []
+    sqliteReadPool = []
 
-  // Close write connection
-  if (writeDb) {
-    try {
-      writeDb.close()
-    } catch (error) {
-      console.error("Error closing write connection:", error)
+    // Close write connection
+    if (sqliteWriteDb) {
+      try {
+        sqliteWriteDb.close()
+      } catch (error) {
+        console.error("Error closing write connection:", error)
+      }
+      sqliteWriteDb = null
     }
-    writeDb = null
+  } else {
+    if (mysqlPool) {
+      await mysqlPool.end()
+      mysqlPool = null
+    }
   }
 
   poolInitialized = false
   currentReadIndex = 0
 }
 
-export function insertEntity(entity: Entity): void {
+type QueryParam = string | number | Buffer | null
+
+async function dbAll(sql: string, params: QueryParam[] = [], conn?: PoolConnection): Promise<any[]> {
+  if (dbEngine === "sqlite") {
+    const database = getSqliteReadConnection()
+    const stmt = database.prepare(sql)
+    return (params.length > 0 ? stmt.all(...params) : stmt.all()) as any[]
+  }
+
+  if (!mysqlPool) {
+    throw new Error("MySQL pool not initialized. Call initDatabase() first.")
+  }
+
+  const runner = conn ?? mysqlPool
+  const [rows] = await runner.execute(sql, params)
+  return rows as any[]
+}
+
+async function dbGet(sql: string, params: QueryParam[] = [], conn?: PoolConnection): Promise<any | undefined> {
+  if (dbEngine === "sqlite") {
+    const database = getSqliteReadConnection()
+    const stmt = database.prepare(sql)
+    return (params.length > 0 ? stmt.get(...params) : stmt.get()) as any | undefined
+  }
+
+  const rows = await dbAll(sql, params, conn)
+  return rows[0]
+}
+
+async function dbRun(sql: string, params: QueryParam[] = [], conn?: PoolConnection): Promise<void> {
+  if (dbEngine === "sqlite") {
+    const database = getSqliteWriteConnection()
+    const stmt = database.prepare(sql)
+    if (params.length > 0) stmt.run(...params)
+    else stmt.run()
+    return
+  }
+
+  if (!mysqlPool) {
+    throw new Error("MySQL pool not initialized. Call initDatabase() first.")
+  }
+
+  const runner = conn ?? mysqlPool
+  await runner.execute(sql, params)
+}
+
+async function withTransaction<T>(fn: (conn?: PoolConnection) => Promise<T>): Promise<T> {
+  if (dbEngine === "sqlite") {
+    const database = getSqliteWriteConnection()
+    database.run("BEGIN IMMEDIATE TRANSACTION")
+    try {
+      const result = await fn(undefined)
+      database.run("COMMIT")
+      return result
+    } catch (error) {
+      database.run("ROLLBACK")
+      throw error
+    }
+  }
+
+  if (!mysqlPool) {
+    throw new Error("MySQL pool not initialized. Call initDatabase() first.")
+  }
+
+  const conn = await mysqlPool.getConnection()
+  try {
+    await conn.beginTransaction()
+    const result = await fn(conn)
+    await conn.commit()
+    return result
+  } catch (error) {
+    try {
+      await conn.rollback()
+    } finally {
+      conn.release()
+    }
+    throw error
+  } finally {
+    conn.release()
+  }
+}
+
+async function insertEntityInternal(entity: Entity, conn?: PoolConnection): Promise<void> {
   const startTime = performance.now()
-  const database = getWriteConnection()
 
   // Convert entity key from string to BLOB
   const entityKeyBuffer = Buffer.from(entity.key, "utf-8")
@@ -191,57 +388,51 @@ export function insertEntity(entity: Entity): void {
 
   // Insert into payloads table
   // from_block uses lastModifiedAtBlock, to_block uses expiresAt
-  const insertPayloadStmt = database.prepare(`
-    INSERT INTO payloads (
-      entity_key, from_block, to_block, payload, content_type,
-      string_attributes, numeric_attributes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-  `)
-
-  insertPayloadStmt.run(
-    entityKeyBuffer,
-    entity.lastModifiedAtBlock,
-    entity.expiresAt,
-    payload,
-    entity.contentType,
-    stringAttributesJson,
-    numericAttributesJson,
+  await dbRun(
+    `
+      INSERT INTO payloads (
+        entity_key, from_block, to_block, payload, content_type,
+        string_attributes, numeric_attributes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    [
+      entityKeyBuffer,
+      entity.lastModifiedAtBlock,
+      entity.expiresAt,
+      payload,
+      entity.contentType,
+      stringAttributesJson,
+      numericAttributesJson,
+    ],
+    conn,
   )
 
   // Insert string attributes into separate table for querying
   if (Object.keys(stringAnnotations).length > 0) {
-    const insertStringAttrStmt = database.prepare(`
-      INSERT INTO string_attributes (
-        entity_key, from_block, to_block, key, value
-      ) VALUES (?, ?, ?, ?, ?)
-    `)
-
     for (const [key, value] of Object.entries(stringAnnotations)) {
-      insertStringAttrStmt.run(
-        entityKeyBuffer,
-        entity.lastModifiedAtBlock,
-        entity.expiresAt,
-        key,
-        value,
+      await dbRun(
+        `
+          INSERT INTO string_attributes (
+            entity_key, from_block, to_block, \`key\`, value
+          ) VALUES (?, ?, ?, ?, ?)
+        `,
+        [entityKeyBuffer, entity.lastModifiedAtBlock, entity.expiresAt, key, value],
+        conn,
       )
     }
   }
 
   // Insert numeric attributes into separate table for querying
   if (entity.numericAnnotations) {
-    const insertNumericAttrStmt = database.prepare(`
-      INSERT INTO numeric_attributes (
-        entity_key, from_block, to_block, key, value
-      ) VALUES (?, ?, ?, ?, ?)
-    `)
-
     for (const [key, value] of Object.entries(entity.numericAnnotations)) {
-      insertNumericAttrStmt.run(
-        entityKeyBuffer,
-        entity.lastModifiedAtBlock,
-        entity.expiresAt,
-        key,
-        value,
+      await dbRun(
+        `
+          INSERT INTO numeric_attributes (
+            entity_key, from_block, to_block, \`key\`, value
+          ) VALUES (?, ?, ?, ?, ?)
+        `,
+        [entityKeyBuffer, entity.lastModifiedAtBlock, entity.expiresAt, key, value],
+        conn,
       )
     }
   }
@@ -250,54 +441,210 @@ export function insertEntity(entity: Entity): void {
   logDbOperation(`insertEntity(key=${entity.key})`, duration)
 }
 
-export function insertEntitiesBatch(entities: PendingEntity[], blockNumber: number = 0): void {
-  const startTime = performance.now()
-  const database = getWriteConnection()
-  immediateTransaction(database, () => {
-    const insertReceiptStmt = database.prepare(`
-      INSERT INTO entity_receipts (id, entity_key, created_at_block)
-      VALUES (?, ?, ?)
-    `)
+export async function insertEntity(entity: Entity): Promise<void> {
+  await insertEntityInternal(entity)
+}
 
+async function updateBlockNumberInternal(blockNumber: number, conn?: PoolConnection): Promise<void> {
+  if (dbEngine === "sqlite") {
+    await dbRun(
+      "INSERT INTO last_block (id, block) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET block = excluded.block",
+      [blockNumber],
+      conn,
+    )
+    return
+  }
+
+  await dbRun(
+    "INSERT INTO last_block (id, block) VALUES (1, ?) ON DUPLICATE KEY UPDATE block = VALUES(block)",
+    [blockNumber],
+    conn,
+  )
+}
+
+export async function insertEntitiesBatch(
+  entities: PendingEntity[],
+  blockNumber: number = 0,
+): Promise<void> {
+  const startTime = performance.now()
+  if (dbEngine === "mysql") {
+    await withTransaction(async (conn) => {
+      if (!conn) {
+        throw new Error("MySQL transaction connection is missing")
+      }
+
+      const payloadRows: QueryParam[][] = []
+      const receiptRows: QueryParam[][] = []
+      const stringAttrRows: QueryParam[][] = []
+      const numericAttrRows: QueryParam[][] = []
+
+      for (const entity of entities) {
+        entity.createdAtBlock = blockNumber
+        entity.lastModifiedAtBlock = blockNumber
+
+        const entityKeyBuffer = Buffer.from(entity.key, "utf-8")
+        const payload =
+          typeof entity.payload === "string"
+            ? Buffer.from(entity.payload, "base64")
+            : entity.payload || null
+
+        const stringAnnotations = entity.stringAnnotations ? { ...entity.stringAnnotations } : {}
+        if (entity.ownerAddress) {
+          stringAnnotations.ownerAddress = entity.ownerAddress
+        }
+
+        const stringAttributesJson =
+          Object.keys(stringAnnotations).length > 0 ? JSON.stringify(stringAnnotations) : "{}"
+        const numericAttributesJson = entity.numericAnnotations
+          ? JSON.stringify(entity.numericAnnotations)
+          : "{}"
+
+        payloadRows.push([
+          entityKeyBuffer,
+          entity.lastModifiedAtBlock,
+          entity.expiresAt,
+          payload,
+          entity.contentType,
+          stringAttributesJson,
+          numericAttributesJson,
+        ])
+
+        receiptRows.push([entity.id, entity.key, entity.createdAtBlock])
+
+        for (const [key, value] of Object.entries(stringAnnotations)) {
+          stringAttrRows.push([
+            entityKeyBuffer,
+            entity.lastModifiedAtBlock,
+            entity.expiresAt,
+            key,
+            value,
+          ])
+        }
+
+        if (entity.numericAnnotations) {
+          for (const [key, value] of Object.entries(entity.numericAnnotations)) {
+            numericAttrRows.push([
+              entityKeyBuffer,
+              entity.lastModifiedAtBlock,
+              entity.expiresAt,
+              key,
+              value,
+            ])
+          }
+        }
+      }
+
+      async function bulkInsert(
+        table: string,
+        columns: string[],
+        rows: QueryParam[][],
+        chunkRows: number,
+      ): Promise<void> {
+        if (rows.length === 0) return
+
+        const rowWidth = columns.length
+        const rowPlaceholders = `(${Array.from({ length: rowWidth }, () => "?").join(", ")})`
+
+        for (let i = 0; i < rows.length; i += chunkRows) {
+          const chunk = rows.slice(i, i + chunkRows)
+          const sql = `INSERT INTO ${table} (${columns.join(", ")}) VALUES ${chunk
+            .map(() => rowPlaceholders)
+            .join(", ")}`
+          const params = chunk.flat()
+          await dbRun(sql, params, conn)
+        }
+      }
+
+      // Conservative chunking for payloads (can include large blobs).
+      await bulkInsert(
+        "payloads",
+        [
+          "entity_key",
+          "from_block",
+          "to_block",
+          "payload",
+          "content_type",
+          "string_attributes",
+          "numeric_attributes",
+        ],
+        payloadRows,
+        50,
+      )
+
+      await bulkInsert(
+        "entity_receipts",
+        ["id", "entity_key", "created_at_block"],
+        receiptRows,
+        1000,
+      )
+
+      await bulkInsert(
+        "string_attributes",
+        ["entity_key", "from_block", "to_block", "`key`", "value"],
+        stringAttrRows,
+        2000,
+      )
+
+      await bulkInsert(
+        "numeric_attributes",
+        ["entity_key", "from_block", "to_block", "`key`", "value"],
+        numericAttrRows,
+        2000,
+      )
+
+      await updateBlockNumberInternal(blockNumber, conn)
+    })
+
+    const duration = performance.now() - startTime
+    logDbOperation(`insertEntitiesBatch(count=${entities.length})`, duration)
+    return
+  }
+
+  await withTransaction(async (conn) => {
     for (const entity of entities) {
       entity.createdAtBlock = blockNumber
       entity.lastModifiedAtBlock = blockNumber
       
-      insertEntity(entity)
-      // Store receipt for this entity
-      insertReceiptStmt.run(entity.id, entity.key, entity.createdAtBlock)
+      await insertEntityInternal(entity, conn)
+      await dbRun(
+        `
+          INSERT INTO entity_receipts (id, entity_key, created_at_block)
+          VALUES (?, ?, ?)
+        `,
+        [entity.id, entity.key, entity.createdAtBlock],
+        conn,
+      )
     }
+    await updateBlockNumberInternal(blockNumber, conn)
   })
-  updateBlockNumber(blockNumber)
   const duration = performance.now() - startTime
   logDbOperation(`insertEntitiesBatch(count=${entities.length})`, duration)
 }
 
-export function removeExpiredEntities(blockNumber: number): void {
+export async function removeExpiredEntities(blockNumber: number): Promise<void> {
   const startTime = performance.now()
-  const database = getWriteConnection()
-  immediateTransaction(database, () => {
-    database.prepare("DELETE FROM payloads WHERE to_block = ?").run(blockNumber)
+  await withTransaction(async (conn) => {
+    await dbRun("DELETE FROM payloads WHERE to_block = ?", [blockNumber], conn)
   })
   const duration = performance.now() - startTime
   logDbOperation(`removeExpiredEntities(blockNumber=${blockNumber})`, duration)
 }
 
-export function getEntityByKey(key: string): Entity | null {
+export async function getEntityByKey(key: string): Promise<Entity | null> {
   const startTime = performance.now()
-  const database = getReadConnection()
 
   // Convert key to BLOB for querying
   const entityKeyBuffer = Buffer.from(key, "utf-8")
 
-  const getEntityStmt = database.prepare(`
-    SELECT * FROM payloads
-    WHERE entity_key = ?
-    ORDER BY from_block DESC
-    LIMIT 1
-  `)
-
-  const row = getEntityStmt.get(entityKeyBuffer) as any
+  const row = (await dbGet(
+    `
+      SELECT * FROM payloads
+      WHERE entity_key = ?
+      ORDER BY from_block DESC
+      LIMIT 1
+    `,
+    [entityKeyBuffer],
+  )) as any
   if (!row) {
     const duration = performance.now() - startTime
     logDbOperation(`getEntityByKey(key=${key}) - not found`, duration)
@@ -607,13 +954,12 @@ function buildSqlFromArkivQuery(
  * Parameters are built fresh each time from the actual query values.
  */
 async function executeArkivQuery(
-  database: Database,
   arkivQuery: string,
   limit: number,
   offset: number,
 ): Promise<Array<Record<string, unknown>>> {
   // Get current block number (needed for building params)
-  const currentBlock = getCurrentBlockNumber()
+  const currentBlock = await getCurrentBlockNumber()
 
   let sqlQuery: string
   let params: (string | number)[]
@@ -649,9 +995,7 @@ async function executeArkivQuery(
   // Execute the SQL query with fresh parameters
   console.log("sqlQuery", sqlQuery)
   console.log("params", params)
-  const stmt = database.prepare(sqlQuery)
-  const rows = stmt.all(...params) as Array<Record<string, unknown>>
-  
+  const rows = (await dbAll(sqlQuery, params as QueryParam[])) as Array<Record<string, unknown>>
   return rows
 }
 
@@ -664,14 +1008,13 @@ export async function queryEntities(
   withAnnotations: boolean = false,
 ): Promise<Entity[]> {
   const startTime = performance.now()
-  const database = getReadConnection()
 
   // Build Arkiv query string
   const arkivQuery = buildArkivQuery(ownerAddress, stringAnnotations, numericAnnotations)
   console.log("arkivQuery", arkivQuery)
 
   // Execute query and get rows (now async)
-  const rows = await executeArkivQuery(database, arkivQuery, limit, offset)
+  const rows = await executeArkivQuery(arkivQuery, limit, offset)
 
   const duration = performance.now() - startTime
   logDbOperation(
@@ -764,45 +1107,46 @@ export async function queryEntities(
   return result
 }
 
-export function getCurrentBlockNumber(): number {
-  const database = getReadConnection()
-  const stmt = database.prepare("SELECT block FROM last_block WHERE id = 1")
-  const result = stmt.get() as { block: number }
-  return result.block
+export async function getCurrentBlockNumber(): Promise<number> {
+  const result = (await dbGet("SELECT block FROM last_block WHERE id = 1")) as
+    | { block: number }
+    | undefined
+  return result?.block ?? 0
 }
 
-export function updateBlockNumber(blockNumber: number): void {
-  const database = getWriteConnection()
-  database.prepare("UPDATE last_block SET block = ? WHERE id = 1").run(blockNumber)
+export async function updateBlockNumber(blockNumber: number): Promise<void> {
+  await updateBlockNumberInternal(blockNumber)
 }
 
-export function countEntities(): number {
+export async function countEntities(): Promise<number> {
   const startTime = performance.now()
-  const database = getReadConnection()
   // Count distinct entity_keys in payloads table
-  const stmt = database.prepare("SELECT COUNT(DISTINCT entity_key) as count FROM payloads")
-  const result = stmt.get() as { count: number }
+  const result = (await dbGet("SELECT COUNT(DISTINCT entity_key) as count FROM payloads")) as {
+    count: number
+  }
   const duration = performance.now() - startTime
   logDbOperation(`countEntities(count=${result.count})`, duration)
   return result.count
 }
 
-export function getEntityBasicInfo(key: string): { key: string; createdAtBlock: number } | null {
+export async function getEntityBasicInfo(
+  key: string,
+): Promise<{ key: string; createdAtBlock: number } | null> {
   const startTime = performance.now()
-  const database = getReadConnection()
 
   // Convert key to BLOB for querying
   const entityKeyBuffer = Buffer.from(key, "utf-8")
 
-  const stmt = database.prepare(`
-    SELECT entity_key, from_block
-    FROM payloads
-    WHERE entity_key = ?
-    ORDER BY from_block DESC
-    LIMIT 1
-  `)
-
-  const row = stmt.get(entityKeyBuffer) as { entity_key: Buffer; from_block: number } | undefined
+  const row = (await dbGet(
+    `
+      SELECT entity_key, from_block
+      FROM payloads
+      WHERE entity_key = ?
+      ORDER BY from_block DESC
+      LIMIT 1
+    `,
+    [entityKeyBuffer],
+  )) as { entity_key: Buffer; from_block: number } | undefined
   if (!row) {
     const duration = performance.now() - startTime
     logDbOperation(`getEntityBasicInfo(key=${key}) - not found`, duration)
@@ -818,23 +1162,20 @@ export function getEntityBasicInfo(key: string): { key: string; createdAtBlock: 
   }
 }
 
-export function getReceiptById(id: string): {
+export async function getReceiptById(id: string): Promise<{
   id: string
   key: string
   createdAtBlock: number
-} | null {
+} | null> {
   const startTime = performance.now()
-  const database = getReadConnection()
-
-  const stmt = database.prepare(`
-    SELECT id, entity_key, created_at_block
-    FROM entity_receipts
-    WHERE id = ?
-  `)
-
-  const row = stmt.get(id) as
-    | { id: string; entity_key: string; created_at_block: number }
-    | undefined
+  const row = (await dbGet(
+    `
+      SELECT id, entity_key, created_at_block
+      FROM entity_receipts
+      WHERE id = ?
+    `,
+    [id],
+  )) as { id: string; entity_key: string; created_at_block: number } | undefined
 
   if (!row) {
     const duration = performance.now() - startTime
@@ -852,18 +1193,18 @@ export function getReceiptById(id: string): {
   }
 }
 
-export function cleanAllData(): void {
-  const database = getWriteConnection()
-  immediateTransaction(database, () => {
+export async function cleanAllData(): Promise<void> {
+  await withTransaction(async (conn) => {
     // Delete all attributes
-    database.prepare("DELETE FROM string_attributes").run()
-    database.prepare("DELETE FROM numeric_attributes").run()
+    await dbRun("DELETE FROM string_attributes", [], conn)
+    await dbRun("DELETE FROM numeric_attributes", [], conn)
     // Delete all payloads
-    database.prepare("DELETE FROM payloads").run()
+    await dbRun("DELETE FROM payloads", [], conn)
     // Delete all receipts
-    database.prepare("DELETE FROM entity_receipts").run()
+    await dbRun("DELETE FROM entity_receipts", [], conn)
     // Reset last_block
-    database.prepare("DELETE FROM last_block").run()
+    await dbRun("UPDATE last_block SET block = 0 WHERE id = 1", [], conn)
+    await ensureLastBlockInitialized(conn)
   })
   // Clear query cache when cleaning data
   queryCache.clear()
@@ -907,8 +1248,13 @@ export function getQueryCacheSize(): number {
   return queryCache.size
 }
 
-export function vacuumDatabase(): void {
-  const database = getWriteConnection()
+export async function vacuumDatabase(): Promise<void> {
+  if (dbEngine === "mysql") {
+    // MySQL doesn't have VACUUM; OPTIMIZE can be expensive and require privileges.
+    return
+  }
+
+  const database = getSqliteWriteConnection()
 
   // When using WAL mode, we need to checkpoint and then switch modes for effective VACUUM
   // Checkpoint WAL file to merge it into the main database

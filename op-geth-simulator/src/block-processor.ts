@@ -8,6 +8,7 @@ const PROCESSING_LOG_FILE = "processing.log"
 
 let intervalId: NodeJS.Timeout | null = null
 let testName: string = ""
+let processingInFlight = false
 
 function getDefaultTestName(): string {
   const now = new Date()
@@ -25,7 +26,7 @@ function logToProcessingLog(message: string): void {
   }
 }
 
-export function startBlockProcessor(testname?: string): void {
+export async function startBlockProcessor(testname?: string): Promise<void> {
   if (intervalId) {
     console.log("Block processor already running")
     return
@@ -37,7 +38,7 @@ export function startBlockProcessor(testname?: string): void {
   // Set testname in logger so queries can use it
   setLoggerTestName(testName)
 
-  const lastBlockNumber = getCurrentBlockNumber()
+  const lastBlockNumber = await getCurrentBlockNumber()
   console.log("Setting current block number to", lastBlockNumber)
   writeQueue.setCurrentBlockNumber(lastBlockNumber)
 
@@ -47,7 +48,7 @@ export function startBlockProcessor(testname?: string): void {
   console.log("Starting block processor (processing every 2 seconds)...")
 
   intervalId = setInterval(() => {
-    processBlock()
+    void processBlock()
   }, 2000)
 }
 
@@ -75,11 +76,15 @@ function countAttributes(entities: PendingEntity[]): { stringCount: number; nume
   return { stringCount, numericCount }
 }
 
-function processBlock(): void {
+async function processBlock(): Promise<void> {
+  if (processingInFlight) return
+  processingInFlight = true
+
   const totalStartTime = performance.now()
   const pendingEntities = writeQueue.dequeueAll()
 
   if (pendingEntities.length === 0) {
+    processingInFlight = false
     return // No entities to process
   }
 
@@ -89,7 +94,7 @@ function processBlock(): void {
 
   // Time removeExpiredEntities separately
   const removeStartTime = performance.now()
-  removeExpiredEntities(blockNumber)
+  await removeExpiredEntities(blockNumber)
   const removeDuration = performance.now() - removeStartTime
 
   // Count attributes
@@ -98,7 +103,7 @@ function processBlock(): void {
   try {
     // Time insertEntitiesBatch separately
     const insertStartTime = performance.now()
-    insertEntitiesBatch(pendingEntities, blockNumber)
+    await insertEntitiesBatch(pendingEntities, blockNumber)
     const insertDuration = performance.now() - insertStartTime
 
     const totalDuration = performance.now() - totalStartTime
@@ -119,5 +124,7 @@ function processBlock(): void {
     const errorMessage = `[BLOCK] Block ${blockNumber} error after ${totalDuration.toFixed(2)}ms: ${error}`
     console.error(errorMessage)
     // Entities are lost if transaction fails - in production, you might want to retry or persist the queue
+  } finally {
+    processingInFlight = false
   }
 }

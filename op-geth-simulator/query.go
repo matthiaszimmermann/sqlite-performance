@@ -71,8 +71,8 @@ func GetEntityByKey(key string) (*Entity, error) {
 
 	arkivQuery := fmt.Sprintf(`$key = "%s"`, key)
 
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(1)
+	atBlock := hexutil.Uint64(uint64(currentBlock))
+	resultsPerPage := hexutil.Uint64(1)
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -122,8 +122,8 @@ func QueryEntities(ownerAddress string, stringAnnotations map[string]string, num
 	arkivQuery := buildArkivQuery(ownerAddress, stringAnnotations, numericAnnotations)
 
 	// Use SQLiteStore.QueryEntities with proper Options
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(limit)
+	atBlock := hexutil.Uint64(uint64(currentBlock))
+	resultsPerPage := hexutil.Uint64(uint64(limit))
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -217,8 +217,8 @@ func CountEntities() (int, error) {
 	currentBlock := GetCurrentBlockNumber()
 
 	// Query all entities with empty query to get total count
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(1) // We only need the count
+	atBlock := hexutil.Uint64(uint64(currentBlock))
+	resultsPerPage := hexutil.Uint64(1) // We only need the count
 	options := &sqlitestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
@@ -250,8 +250,8 @@ func GetExpiredEntities(blockNumber int64) ([]common.Hash, error) {
 	// Expiration is stored as $expiration in numeric attributes
 	// Use <= operator to get all entities that have expired
 	arkivQuery := fmt.Sprintf("$expiration = %d", blockNumber)
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(10000) // Large limit to get all expired entities
+	atBlock := hexutil.Uint64(uint64(currentBlock))
+	resultsPerPage := hexutil.Uint64(10000) // Large limit to get all expired entities
 
 	// Use IncludeData to only fetch the key field for performance
 	includeData := &sqlitestore.IncludeData{
