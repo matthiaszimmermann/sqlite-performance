@@ -130,7 +130,9 @@ export async function initDatabase(
         connectionLimit: poolSizeOverride ?? poolSize,
       })
 
-  await mysqlPool.execute(`
+  const pool = mysqlPool
+
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version BIGINT NOT NULL,
       dirty BOOLEAN NOT NULL DEFAULT FALSE,
@@ -138,7 +140,7 @@ export async function initDatabase(
     )
   `)
 
-  await mysqlPool.execute(`
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS payloads (
       entity_key VARBINARY(255) NOT NULL,
       from_block BIGINT NOT NULL,
@@ -151,7 +153,7 @@ export async function initDatabase(
     )
   `)
 
-  await mysqlPool.execute(`
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS string_attributes (
       entity_key VARBINARY(255) NOT NULL,
       from_block BIGINT NOT NULL,
@@ -162,7 +164,7 @@ export async function initDatabase(
     )
   `)
 
-  await mysqlPool.execute(`
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS numeric_attributes (
       entity_key VARBINARY(255) NOT NULL,
       from_block BIGINT NOT NULL,
@@ -173,7 +175,7 @@ export async function initDatabase(
     )
   `)
 
-  await mysqlPool.execute(`
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS last_block (
       id TINYINT NOT NULL,
       block BIGINT NOT NULL,
@@ -181,13 +183,45 @@ export async function initDatabase(
     )
   `)
 
-  await mysqlPool.execute(`
+  await pool.execute(`
     CREATE TABLE IF NOT EXISTS entity_receipts (
       id VARCHAR(255) NOT NULL PRIMARY KEY,
       entity_key TEXT NOT NULL,
       created_at_block BIGINT NOT NULL
     )
   `)
+
+  // Indexes mirrored from arkiv.schema.sql (SQLite).
+  // Note: MySQL cannot index full TEXT; we use a prefix length for `value`.
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS string_attributes_entity_key_value_index ON string_attributes (from_block, to_block, `key`, value(191))",
+  )
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS string_attributes_kv_temporal_idx ON string_attributes (`key`, value(191), from_block DESC, to_block DESC)",
+  )
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS string_attributes_entity_key_index ON string_attributes (from_block, to_block, `key`)",
+  )
+  await pool.execute("CREATE INDEX IF NOT EXISTS string_attributes_delete_index ON string_attributes (to_block)")
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS string_attributes_entity_kv_idx ON string_attributes (entity_key, `key`, from_block DESC)",
+  )
+
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS numeric_attributes_entity_key_value_index ON numeric_attributes (from_block, to_block, `key`, value)",
+  )
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS numeric_attributes_entity_key_index ON numeric_attributes (from_block, to_block, `key`)",
+  )
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS numeric_attributes_kv_temporal_idx ON numeric_attributes (`key`, value, from_block DESC, to_block DESC)",
+  )
+  await pool.execute("CREATE INDEX IF NOT EXISTS numeric_attributes_delete_index ON numeric_attributes (to_block)")
+
+  await pool.execute(
+    "CREATE INDEX IF NOT EXISTS payloads_entity_key_index ON payloads (entity_key, from_block, to_block)",
+  )
+  await pool.execute("CREATE INDEX IF NOT EXISTS payloads_delete_index ON payloads (to_block)")
 
   await ensureLastBlockInitialized()
 
