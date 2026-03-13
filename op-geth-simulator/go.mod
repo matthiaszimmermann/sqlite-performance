@@ -4,7 +4,7 @@ go 1.25.4
 
 require (
 	github.com/Arkiv-Network/arkiv-events v0.0.4
-	github.com/Arkiv-Network/sqlite-bitmap-store v0.0.17
+	github.com/Arkiv-Network/sqlite-bitmap-store v0.0.23
 	github.com/ethereum/go-ethereum v1.16.7
 	github.com/gorilla/mux v1.8.1
 	github.com/mattn/go-sqlite3 v1.14.33
@@ -12,11 +12,16 @@ require (
 
 require (
 	github.com/RoaringBitmap/roaring/v2 v2.14.4 // indirect
+	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/alecthomas/participle/v2 v2.1.4 // indirect
 	github.com/bits-and-blooms/bitset v1.24.2 // indirect
+	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/golang-migrate/migrate/v4 v4.19.1 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
+	github.com/shirou/gopsutil v3.21.4-0.20210419000835-c7a38de76ee5+incompatible // indirect
+	github.com/tklauser/go-sysconf v0.3.12 // indirect
+	github.com/tklauser/numcpus v0.6.1 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
