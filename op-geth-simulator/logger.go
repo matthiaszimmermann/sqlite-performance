@@ -320,7 +320,7 @@ func (h *CustomSlogHandler) WithGroup(name string) slog.Handler {
 	return h
 }
 
-// GetStoreLogger returns a slog.Logger configured for the sqlite-bitmap-store
+// GetStoreLogger returns a slog.Logger configured for the pebble-bitmap-store
 // It uses the custom handler to route logs to appropriate files
 func GetStoreLogger() *slog.Logger {
 	handler := NewCustomSlogHandler()

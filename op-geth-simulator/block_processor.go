@@ -9,7 +9,7 @@ import (
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
 	"github.com/Arkiv-Network/arkiv-events/events"
-	"github.com/Arkiv-Network/sqlite-bitmap-store/pusher"
+	"github.com/Arkiv-Network/pebble-bitmap-store/pusher"
 	"github.com/ethereum/go-ethereum/common"
 )
 

@@ -17,8 +17,8 @@ import (
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
 	"github.com/Arkiv-Network/arkiv-events/events"
-	sqlitestore "github.com/Arkiv-Network/sqlite-bitmap-store"
-	"github.com/Arkiv-Network/sqlite-bitmap-store/pusher"
+	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store/pebblestore"
+	"github.com/Arkiv-Network/pebble-bitmap-store/pusher"
 	"github.com/ethereum/go-ethereum/common"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -43,7 +43,7 @@ type PayloadData struct {
 
 var (
 	blockPool                []BlockData
-	targetStore              *sqlitestore.SQLiteStore
+	targetStore              *pebblestore.PebbleStore
 	targetPushIterator       *pusher.PushIterator
 	targetFollowEventsCtx    context.Context
 	targetFollowEventsCancel context.CancelFunc
@@ -216,7 +216,7 @@ func loadBlockPool(sourceDb *sql.DB) error {
 func initializeTargetDatabase(targetDbPath string) error {
 	fmt.Println("Opening target database...")
 	logger := GetStoreLogger()
-	store, err := sqlitestore.NewSQLiteStore(logger, targetDbPath, 7)
+	store, err := pebblestore.NewPebbleStore(logger, targetDbPath)
 	if err != nil {
 		return fmt.Errorf("failed to initialize target store: %w", err)
 	}

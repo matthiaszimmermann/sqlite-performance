@@ -11,25 +11,25 @@ import (
 	"time"
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
-	sqlitestore "github.com/Arkiv-Network/sqlite-bitmap-store"
+	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store/pebblestore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 var (
-	storeInstance *sqlitestore.SQLiteStore
+	storeInstance *pebblestore.PebbleStore
 	storeOnce     sync.Once
 	storeMutex    sync.RWMutex
 )
 
-// InitStore initializes the sqlite-bitmap-store
+// InitStore initializes the pebble-bitmap-store
 func InitStore(dbPath string) error {
 	var err error
 	storeOnce.Do(func() {
 		// Use the custom logger that routes logs to appropriate files
 		logger := GetStoreLogger()
 
-		storeInstance, err = sqlitestore.NewSQLiteStore(logger, dbPath, 7)
+		storeInstance, err = pebblestore.NewPebbleStore(logger, dbPath)
 		if err != nil {
 			log.Printf("Failed to initialize store: %v", err)
 		}
@@ -71,9 +71,9 @@ func GetEntityByKey(key string) (*Entity, error) {
 
 	arkivQuery := fmt.Sprintf(`$key = "%s"`, key)
 
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(1)
-	options := &sqlitestore.Options{
+	atBlock := hexutil.Uint64(currentBlock)
+	resultsPerPage := hexutil.Uint64(1)
+	options := &pebblestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
 	}
@@ -121,10 +121,10 @@ func QueryEntities(ownerAddress string, stringAnnotations map[string]string, num
 	// Build Arkiv query string from filter parameters
 	arkivQuery := buildArkivQuery(ownerAddress, stringAnnotations, numericAnnotations)
 
-	// Use SQLiteStore.QueryEntities with proper Options
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(limit)
-	options := &sqlitestore.Options{
+	// Use PebbleStore.QueryEntities with proper Options
+	atBlock := hexutil.Uint64(currentBlock)
+	resultsPerPage := hexutil.Uint64(limit)
+	options := &pebblestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
 	}
@@ -217,9 +217,9 @@ func CountEntities() (int, error) {
 	currentBlock := GetCurrentBlockNumber()
 
 	// Query all entities with empty query to get total count
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(1) // We only need the count
-	options := &sqlitestore.Options{
+	atBlock := hexutil.Uint64(currentBlock)
+	resultsPerPage := hexutil.Uint64(1) // We only need the count
+	options := &pebblestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
 	}
@@ -250,11 +250,11 @@ func GetExpiredEntities(blockNumber int64) ([]common.Hash, error) {
 	// Expiration is stored as $expiration in numeric attributes
 	// Use <= operator to get all entities that have expired
 	arkivQuery := fmt.Sprintf("$expiration = %d", blockNumber)
-	atBlock := uint64(currentBlock)
-	resultsPerPage := uint64(10000) // Large limit to get all expired entities
+	atBlock := hexutil.Uint64(currentBlock)
+	resultsPerPage := hexutil.Uint64(10000) // Large limit to get all expired entities
 
 	// Use IncludeData to only fetch the key field for performance
-	includeData := &sqlitestore.IncludeData{
+	includeData := &pebblestore.IncludeData{
 		Key:                         true,
 		Attributes:                  false,
 		SyntheticAttributes:         false,
@@ -268,7 +268,7 @@ func GetExpiredEntities(blockNumber int64) ([]common.Hash, error) {
 		OperationIndexInTransaction: false,
 	}
 
-	options := &sqlitestore.Options{
+	options := &pebblestore.Options{
 		AtBlock:        &atBlock,
 		ResultsPerPage: &resultsPerPage,
 		IncludeData:    includeData,
@@ -344,10 +344,10 @@ func CleanAllData() error {
 	}
 
 	// CleanAllData - use SQLiteStore methods to clear data
-	// Note: The sqlite-bitmap-store may not have a direct Clear method
+	// Note: The pebble-bitmap-store may not have a direct Clear method
 	// This might need to be implemented differently or may not be available
 	// For now, return an error indicating it's not implemented
-	return fmt.Errorf("CleanAllData not implemented - sqlite-bitmap-store does not provide a Clear method")
+	return fmt.Errorf("CleanAllData not implemented - pebble-bitmap-store does not provide a Clear method")
 }
 
 // parseEntityData parses EntityData from json.RawMessage into Entity
