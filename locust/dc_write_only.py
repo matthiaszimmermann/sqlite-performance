@@ -108,7 +108,7 @@ def workload_to_entity_request(workload: WorkloadEntity, creator_address: str) -
     """
     entity_key = workload.entity_key
     block = workload.block
-    ttl = random.randint(100, 1000)  # Random TTL between 100 and 1000 blocks
+    ttl = random.randint(1000, 10000)  # Random TTL between 100 and 1000 blocks
     expires_at_block = block + ttl
     
     # String attributes (same as in workload_to_sql_inserts)
