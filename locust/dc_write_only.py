@@ -54,7 +54,7 @@ def node_to_entity_request(node: NodeEntity, creator_address: str) -> Dict[str, 
     """
     entity_key = node.entity_key
     block = node.block
-    ttl = random.randint(100, 1000)  # Random TTL between 100 and 1000 blocks
+    ttl = random.randint(1000, 10000)  # Random TTL between 100 and 1000 blocks
     expires_at_block = block + ttl
     
     # String attributes (same as in node_to_sql_inserts)
