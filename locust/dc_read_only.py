@@ -10,14 +10,14 @@ appropriate, leveraging the extended queryEntities API that supports Arkiv query
 language with comparison operators.
 
 Usage:
-    locust -f locust/read_only.py --host=http://localhost:3000
+    locust -f locust/dc_read_only.py --host=http://localhost:3000
 """
 
 import json
 import os
 import random
-import sqlite3
 import sys
+import threading
 from typing import Dict, Any, List, Optional
 from urllib.parse import quote
 
@@ -57,10 +57,6 @@ VM_TYPES = ["cpu", "gpu", "gpu_large"]
 DEFAULT_NODE_LIMIT = 100
 DEFAULT_WORKLOAD_LIMIT = 100
 
-# Database path (can be set via environment variable)
-DB_PATH = os.getenv("DC_DB_PATH", "data/dc_test.db")
-
-
 # =============================================================================
 # Logging Helper
 # =============================================================================
@@ -81,104 +77,76 @@ class GlobalSampleData:
     node_ids: List[str] = []
     workload_ids: List[str] = []
     entity_keys: List[str] = []  # Stored as hex strings for API
-    current_block: int = 1
     initialized: bool = False
+    lock = threading.Lock()
     
     @classmethod
-    def load_from_database(cls, db_path: str) -> None:
-        """Load sample data from database."""
+    @staticmethod
+    def _safe_json(response) -> Optional[Dict[str, Any]]:
+        try:
+            return response.json()
+        except Exception:
+            return None
+
+    @classmethod
+    def load_from_api(cls, client) -> None:
+        """Load sample data from the running API (Pebble-backed)."""
         if cls.initialized:
             return
-        
-        if not os.path.exists(db_path):
-            print(f"Warning: Database not found at {db_path}, using empty sample data")
+
+        with cls.lock:
+            if cls.initialized:
+                return
+
+            print("Loading sample data from API...")
+
+            node_query = {
+                "stringAnnotations": {
+                    "type": "node",
+                },
+                "limit": SAMPLE_SIZE_IDS,
+            }
+            node_resp = client.post("/entities/query", json=node_query, name="bootstrap_nodes")
+            if node_resp.status_code == 200:
+                payload = cls._safe_json(node_resp) or {}
+                for entity in payload.get("entities", []):
+                    node_id = entity.get("stringAnnotations", {}).get("node_id")
+                    if isinstance(node_id, str):
+                        cls.node_ids.append(node_id)
+                    key = entity.get("key")
+                    if isinstance(key, str):
+                        cls.entity_keys.append(key)
+            else:
+                print(f"Warning: failed to bootstrap node samples (status={node_resp.status_code})")
+
+            workload_query = {
+                "stringAnnotations": {
+                    "type": "workload",
+                },
+                "limit": SAMPLE_SIZE_IDS,
+            }
+            workload_resp = client.post("/entities/query", json=workload_query, name="bootstrap_workloads")
+            if workload_resp.status_code == 200:
+                payload = cls._safe_json(workload_resp) or {}
+                for entity in payload.get("entities", []):
+                    workload_id = entity.get("stringAnnotations", {}).get("workload_id")
+                    if isinstance(workload_id, str):
+                        cls.workload_ids.append(workload_id)
+                    key = entity.get("key")
+                    if isinstance(key, str):
+                        cls.entity_keys.append(key)
+            else:
+                print(f"Warning: failed to bootstrap workload samples (status={workload_resp.status_code})")
+
+            cls.node_ids = list(dict.fromkeys(cls.node_ids))
+            cls.workload_ids = list(dict.fromkeys(cls.workload_ids))
+            cls.entity_keys = list(dict.fromkeys(cls.entity_keys))
+
+            print(
+                f"Loaded {len(cls.node_ids)} node IDs, {len(cls.workload_ids)} workload IDs, "
+                f"{len(cls.entity_keys)} entity keys"
+            )
             cls.initialized = True
-            return
-        
-        print(f"Loading sample data from {db_path}...")
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Load node IDs from new schema (string_attributes_values_bitmaps)
-        try:
-            cursor.execute("""
-                SELECT DISTINCT value
-                FROM string_attributes_values_bitmaps
-                WHERE name = 'node_id'
-                ORDER BY RANDOM()
-                LIMIT ?
-            """, (SAMPLE_SIZE_IDS,))
-            
-            for row in cursor.fetchall():
-                node_id = row[0]
-                cls.node_ids.append(node_id)
-        except Exception as e:
-            print(f"Error loading node IDs: {e}")
-        
-        # Load workload IDs from new schema (string_attributes_values_bitmaps)
-        try:
-            cursor.execute("""
-                SELECT DISTINCT value
-                FROM string_attributes_values_bitmaps
-                WHERE name = 'workload_id'
-                ORDER BY RANDOM()
-                LIMIT ?
-            """, (SAMPLE_SIZE_IDS,))
-            
-            for row in cursor.fetchall():
-                workload_id = row[0]
-                cls.workload_ids.append(workload_id)
-        except Exception as e:
-            print(f"Error loading workload IDs: {e}")
-        
-        # Load entity keys (for direct lookups) - get single entity key as requested
-        try:
-            # Try the user's query first (with id column)
-            try:
-                cursor.execute("SELECT * FROM payloads ORDER BY id DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row:
-                    # Get entity_key from the row by column name
-                    columns = [description[0] for description in cursor.description]
-                    if 'entity_key' in columns:
-                        entity_key_idx = columns.index('entity_key')
-                        entity_key = row[entity_key_idx]
-                    else:
-                        # Fallback: assume entity_key is the first column
-                        entity_key = row[0]
-                    
-                    if isinstance(entity_key, bytes):
-                        key_hex = entity_key.hex()
-                        cls.entity_keys.append(f"0x{key_hex}")
-                    else:
-                        key_str = str(entity_key)
-                        if not key_str.startswith("0x"):
-                            cls.entity_keys.append(f"0x{key_str}")
-                        else:
-                            cls.entity_keys.append(key_str)
-            except sqlite3.OperationalError:
-                # If id column doesn't exist, try with from_block
-                cursor.execute("SELECT entity_key FROM payloads ORDER BY from_block DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row:
-                    entity_key = row[0]
-                    if isinstance(entity_key, bytes):
-                        key_hex = entity_key.hex()
-                        cls.entity_keys.append(f"0x{key_hex}")
-                    else:
-                        key_str = str(entity_key)
-                        if not key_str.startswith("0x"):
-                            cls.entity_keys.append(f"0x{key_str}")
-                        else:
-                            cls.entity_keys.append(key_str)
-        except Exception as e:
-            print(f"Error loading entity keys: {e}")
-        
-        conn.close()
-        
-        print(f"Loaded {len(cls.node_ids)} node IDs, {len(cls.workload_ids)} workload IDs, "
-              f"{len(cls.entity_keys)} entity keys (current block: {cls.current_block})")
-        cls.initialized = True
 
 
 # =============================================================================
@@ -197,7 +165,7 @@ class DataCenterReadUser(FastHttpUser):
         """Initialize user-specific state."""
         # Ensure global data is loaded
         if not GlobalSampleData.initialized:
-            GlobalSampleData.load_from_database(DB_PATH)
+            GlobalSampleData.load_from_api(self.client)
     
     @task(20)  # 20% weight
     def point_by_id(self):
@@ -427,19 +395,11 @@ class DataCenterReadUser(FastHttpUser):
 
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
-    """Load sample data once when test starts."""
+    """Print read-test configuration at test start."""
     print("=" * 60)
     print("Initializing read-only stress test")
     print("=" * 60)
-    print(f"Database path: {DB_PATH}")
+    print("Data source: API bootstrap (/entities/query)")
     print(f"Query mix: {QUERY_MIX}")
     print()
-    
-    GlobalSampleData.load_from_database(DB_PATH)
-    
-    if not GlobalSampleData.initialized:
-        print("Warning: Failed to initialize sample data!")
-    else:
-        print("Sample data loaded successfully")
-        print()
 

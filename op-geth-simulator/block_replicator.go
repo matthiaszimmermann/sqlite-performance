@@ -4,15 +4,16 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
@@ -20,7 +21,7 @@ import (
 	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store/pebblestore"
 	"github.com/Arkiv-Network/pebble-bitmap-store/pusher"
 	"github.com/ethereum/go-ethereum/common"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 const (
@@ -34,11 +35,12 @@ type BlockData struct {
 }
 
 type PayloadData struct {
-	EntityKey         []byte
-	Payload           []byte
-	ContentType       string
-	StringAttributes  string // JSON string
-	NumericAttributes string // JSON string
+	EntityKey          []byte
+	Payload            []byte
+	ContentType        string
+	StringAttributes   map[string]string
+	NumericAttributes  map[string]uint64
+	OwnerAddressString string
 }
 
 var (
@@ -52,6 +54,7 @@ var (
 	totalStringAttrs         int
 	totalNumericAttrs        int
 	writeTimes               []float64
+	targetFollowEventsWG     sync.WaitGroup
 )
 
 // generateNewEntityKey generates a new 32-byte entity key
@@ -61,81 +64,114 @@ func generateNewEntityKey() []byte {
 	return key
 }
 
-// getAvailableBlocks gets all available entity keys from source database
-// Since the new schema doesn't have from_block, we'll group by entity_key
-func getAvailableEntityKeys(sourceDb *sql.DB) ([][]byte, error) {
-	query := `
-		SELECT DISTINCT entity_key 
-		FROM payloads 
-		ORDER BY entity_key
-		LIMIT 10000
-	`
-	rows, err := sourceDb.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query available entity keys: %w", err)
-	}
-	defer rows.Close()
+// readAllSourcePayloads loads entities from a source Pebble store using pagination.
+func readAllSourcePayloads(sourceStore *pebblestore.PebbleStore) ([]PayloadData, error) {
+	ctx := context.Background()
 
-	var keys [][]byte
-	for rows.Next() {
-		var key []byte
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("failed to scan entity key: %w", err)
-		}
-		keys = append(keys, key)
+	lastBlock, err := sourceStore.GetLastBlock(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get source last block: %w", err)
 	}
-	return keys, rows.Err()
+
+	atBlock := hexutil.Uint64(lastBlock)
+	resultsPerPage := hexutil.Uint64(200)
+	includeData := &pebblestore.IncludeData{
+		Key:                         true,
+		Attributes:                  true,
+		SyntheticAttributes:         false,
+		Payload:                     true,
+		ContentType:                 true,
+		Expiration:                  false,
+		Creator:                     false,
+		Owner:                       true,
+		CreatedAtBlock:              false,
+		LastModifiedAtBlock:         false,
+		TransactionIndexInBlock:     false,
+		OperationIndexInTransaction: false,
+	}
+
+	payloads := make([]PayloadData, 0, 10000)
+	cursor := ""
+
+	for {
+		options := &pebblestore.Options{
+			AtBlock:        &atBlock,
+			ResultsPerPage: &resultsPerPage,
+			IncludeData:    includeData,
+			Cursor:         cursor,
+		}
+
+		response, err := sourceStore.QueryEntities(ctx, "$all", options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to query source entities: %w", err)
+		}
+
+		for _, item := range response.Data {
+			payload, err := parseSourcePayload(item)
+			if err != nil {
+				continue
+			}
+			payloads = append(payloads, payload)
+		}
+
+		if response.Cursor == nil || *response.Cursor == "" {
+			break
+		}
+		cursor = *response.Cursor
+	}
+
+	return payloads, nil
 }
 
-// readEntityData reads data for specific entity keys from source database
-func readEntityData(sourceDb *sql.DB, entityKeys [][]byte) (*BlockData, error) {
-	blockData := &BlockData{}
-
-	// Read payloads for the given entity keys
-	// Use IN clause or prepare statement for multiple keys
-	if len(entityKeys) == 0 {
-		return blockData, nil
+func parseSourcePayload(data json.RawMessage) (PayloadData, error) {
+	type sourceEntityData struct {
+		Key              *common.Hash    `json:"key,omitempty"`
+		Value            hexutil.Bytes   `json:"value,omitempty"`
+		ContentType      *string         `json:"contentType,omitempty"`
+		Owner            *common.Address `json:"owner,omitempty"`
+		StringAttributes []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"stringAttributes,omitempty"`
+		NumericAttributes []struct {
+			Key   string `json:"key"`
+			Value uint64 `json:"value"`
+		} `json:"numericAttributes,omitempty"`
 	}
 
-	// Build query with placeholders
-	placeholders := ""
-	args := make([]interface{}, len(entityKeys))
-	for i, key := range entityKeys {
-		if i > 0 {
-			placeholders += ","
-		}
-		placeholders += "?"
-		args[i] = key
+	var parsed sourceEntityData
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return PayloadData{}, err
+	}
+	if parsed.Key == nil {
+		return PayloadData{}, fmt.Errorf("missing key")
 	}
 
-	payloadsQuery := fmt.Sprintf(`
-		SELECT entity_key, payload, content_type, string_attributes, numeric_attributes
-		FROM payloads
-		WHERE entity_key IN (%s)
-	`, placeholders)
-
-	rows, err := sourceDb.Query(payloadsQuery, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query payloads: %w", err)
+	payload := PayloadData{
+		EntityKey:         parsed.Key.Bytes(),
+		Payload:           []byte(parsed.Value),
+		StringAttributes:  make(map[string]string),
+		NumericAttributes: make(map[string]uint64),
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var payload PayloadData
-		err := rows.Scan(
-			&payload.EntityKey,
-			&payload.Payload,
-			&payload.ContentType,
-			&payload.StringAttributes,
-			&payload.NumericAttributes,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan payload: %w", err)
-		}
-		blockData.Payloads = append(blockData.Payloads, payload)
+	if parsed.ContentType != nil {
+		payload.ContentType = *parsed.ContentType
+	}
+	if parsed.Owner != nil {
+		payload.OwnerAddressString = parsed.Owner.Hex()
 	}
 
-	return blockData, nil
+	for _, attr := range parsed.StringAttributes {
+		payload.StringAttributes[attr.Key] = attr.Value
+	}
+	for _, attr := range parsed.NumericAttributes {
+		payload.NumericAttributes[attr.Key] = attr.Value
+	}
+
+	if payload.OwnerAddressString != "" {
+		payload.StringAttributes["ownerAddress"] = payload.OwnerAddressString
+	}
+
+	return payload, nil
 }
 
 // createEntityKeyMap creates a mapping from old entity keys to new entity keys
@@ -157,52 +193,47 @@ func createEntityKeyMap(blockData *BlockData) map[string][]byte {
 
 // loadBlockPool loads a pool of random entity groups into memory
 // Each "block" in the pool is a group of entities (simulating a block)
-func loadBlockPool(sourceDb *sql.DB) error {
+func loadBlockPool(sourceStore *pebblestore.PebbleStore) error {
 	fmt.Println("Loading entity pool into memory...")
-	availableEntityKeys, err := getAvailableEntityKeys(sourceDb)
+	sourcePayloads, err := readAllSourcePayloads(sourceStore)
 	if err != nil {
-		return fmt.Errorf("failed to get available entity keys: %w", err)
+		return fmt.Errorf("failed to read source entities: %w", err)
 	}
 
-	fmt.Printf("Found %d entity keys in source database\n", len(availableEntityKeys))
+	fmt.Printf("Found %d entities in source store\n", len(sourcePayloads))
 
-	if len(availableEntityKeys) == 0 {
-		return fmt.Errorf("no entities found in source database")
+	if len(sourcePayloads) == 0 {
+		return fmt.Errorf("no entities found in source store")
 	}
 
 	// Randomly select entity keys to form blocks
 	// Each "block" will contain a random group of entities
 	entitiesPerBlock := 100 // Approximate entities per block
 	totalEntitiesToLoad := blockPoolSize * entitiesPerBlock
-	if len(availableEntityKeys) < totalEntitiesToLoad {
-		totalEntitiesToLoad = len(availableEntityKeys)
+	if len(sourcePayloads) < totalEntitiesToLoad {
+		totalEntitiesToLoad = len(sourcePayloads)
 	}
 
-	// Shuffle entity keys
-	rand.Shuffle(len(availableEntityKeys), func(i, j int) {
-		availableEntityKeys[i], availableEntityKeys[j] = availableEntityKeys[j], availableEntityKeys[i]
+	// Shuffle entities
+	rand.Shuffle(len(sourcePayloads), func(i, j int) {
+		sourcePayloads[i], sourcePayloads[j] = sourcePayloads[j], sourcePayloads[i]
 	})
-	selectedEntityKeys := availableEntityKeys[:totalEntitiesToLoad]
+	selectedPayloads := sourcePayloads[:totalEntitiesToLoad]
 
 	fmt.Printf("Loading %d entities into memory (forming ~%d blocks)...\n", totalEntitiesToLoad, blockPoolSize)
 	loadStartTime := time.Now()
 
-	// Group entities into blocks
+	// Group entities into blocks.
 	blockPool = make([]BlockData, 0, blockPoolSize)
-	for i := 0; i < len(selectedEntityKeys); i += entitiesPerBlock {
+	for i := 0; i < len(selectedPayloads); i += entitiesPerBlock {
 		end := i + entitiesPerBlock
-		if end > len(selectedEntityKeys) {
-			end = len(selectedEntityKeys)
+		if end > len(selectedPayloads) {
+			end = len(selectedPayloads)
 		}
 
-		entityKeysForBlock := selectedEntityKeys[i:end]
-		blockData, err := readEntityData(sourceDb, entityKeysForBlock)
-		if err != nil {
-			return fmt.Errorf("failed to read entities: %w", err)
-		}
-
+		blockData := BlockData{Payloads: selectedPayloads[i:end]}
 		if len(blockData.Payloads) > 0 {
-			blockPool = append(blockPool, *blockData)
+			blockPool = append(blockPool, blockData)
 		}
 	}
 
@@ -229,7 +260,9 @@ func initializeTargetDatabase(targetDbPath string) error {
 	targetFollowEventsCtx, targetFollowEventsCancel = context.WithCancel(context.Background())
 
 	// Start FollowEvents in a separate goroutine - it will run continuously
+	targetFollowEventsWG.Add(1)
 	go func() {
+		defer targetFollowEventsWG.Done()
 		fmt.Println("[FOLLOW] Starting FollowEvents goroutine for replication...")
 		batchIterator := targetPushIterator.Iterator()
 		if err := store.FollowEvents(targetFollowEventsCtx, arkivevents.BatchIterator(batchIterator)); err != nil {
@@ -266,56 +299,14 @@ func writeReplicatedBlockBatch(blocksData []BlockData, targetBlockNumber int64) 
 				newEntityKey = generateNewEntityKey()
 			}
 
-			// Parse string and numeric attributes from JSON
-			// The structure is: {"Values": {"key1": "value1", "key2": "value2"}}
-			type AttributesWrapper struct {
-				Values map[string]interface{} `json:"Values"`
+			stringAttrs := make(map[string]string, len(payload.StringAttributes))
+			for k, v := range payload.StringAttributes {
+				stringAttrs[k] = v
 			}
 
-			var stringAttrs map[string]string = make(map[string]string)
-			var numericAttrs map[string]float64 = make(map[string]float64)
-
-			if payload.StringAttributes != "" {
-				var wrapper AttributesWrapper
-				if err := json.Unmarshal([]byte(payload.StringAttributes), &wrapper); err == nil {
-					if wrapper.Values != nil {
-						for k, v := range wrapper.Values {
-							if strVal, ok := v.(string); ok {
-								stringAttrs[k] = strVal
-							}
-						}
-					}
-				}
-			}
-
-			if payload.NumericAttributes != "" {
-				var wrapper AttributesWrapper
-				if err := json.Unmarshal([]byte(payload.NumericAttributes), &wrapper); err == nil {
-					if wrapper.Values != nil {
-						for k, v := range wrapper.Values {
-							// Try to convert to float64
-							switch val := v.(type) {
-							case float64:
-								numericAttrs[k] = val
-							case int:
-								numericAttrs[k] = float64(val)
-							case int64:
-								numericAttrs[k] = float64(val)
-							case string:
-								// Try to parse as number
-								if numVal, err := strconv.ParseFloat(val, 64); err == nil {
-									numericAttrs[k] = numVal
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Convert numeric attributes to uint64
-			numericAttrsUint64 := make(map[string]uint64)
-			for k, v := range numericAttrs {
-				numericAttrsUint64[k] = uint64(v)
+			numericAttrsUint64 := make(map[string]uint64, len(payload.NumericAttributes))
+			for k, v := range payload.NumericAttributes {
+				numericAttrsUint64[k] = v
 			}
 
 			// Calculate transaction and operation indices (10 operations per transaction)
@@ -341,7 +332,7 @@ func writeReplicatedBlockBatch(blocksData []BlockData, targetBlockNumber int64) 
 				},
 			}
 
-			// Extract owner from string attributes if present
+			// Extract owner from attributes if present.
 			if ownerAddr, ok := stringAttrs["ownerAddress"]; ok {
 				createOp.Create.Owner = common.HexToAddress(ownerAddr)
 			}
@@ -402,11 +393,20 @@ func writeCsvRow(numPayloads, numStringAttrs, numNumericAttrs int, readTimeMs, w
 
 // getOutputDbSize gets the size of the output database file
 func getOutputDbSize(targetDbPath string) int64 {
-	info, err := os.Stat(targetDbPath)
+	var total int64
+	err := filepath.Walk(targetDbPath, func(_ string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
 	if err != nil {
 		return 0
 	}
-	return info.Size()
+	return total
 }
 
 // processBatch processes a batch of blocks
@@ -424,7 +424,7 @@ func processBatch(batchSize int, targetBlockNumber int64) (int, int, int, float6
 		blocksToReplicate = append(blocksToReplicate, blockPool[randomIndex])
 	}
 
-	// Calculate totals for logging
+	// Calculate totals for logging.
 	batchPayloads := 0
 	batchStringAttrs := 0
 	batchNumericAttrs := 0
@@ -432,29 +432,9 @@ func processBatch(batchSize int, targetBlockNumber int64) (int, int, int, float6
 	for _, blockData := range blocksToReplicate {
 		batchPayloads += len(blockData.Payloads)
 
-		// Count attributes from JSON in payloads
-		// The structure is: {"Values": {"key1": "value1", "key2": "value2"}}
-		type AttributesWrapper struct {
-			Values map[string]interface{} `json:"Values"`
-		}
-
 		for _, payload := range blockData.Payloads {
-			if payload.StringAttributes != "" {
-				var wrapper AttributesWrapper
-				if err := json.Unmarshal([]byte(payload.StringAttributes), &wrapper); err == nil {
-					if wrapper.Values != nil {
-						batchStringAttrs += len(wrapper.Values)
-					}
-				}
-			}
-			if payload.NumericAttributes != "" {
-				var wrapper AttributesWrapper
-				if err := json.Unmarshal([]byte(payload.NumericAttributes), &wrapper); err == nil {
-					if wrapper.Values != nil {
-						batchNumericAttrs += len(wrapper.Values)
-					}
-				}
-			}
+			batchStringAttrs += len(payload.StringAttributes)
+			batchNumericAttrs += len(payload.NumericAttributes)
 		}
 	}
 
@@ -544,15 +524,16 @@ func RunBlockReplicator(sourceDbPath, targetDbPath string, numBlocks int) error 
 	// Seed random number generator
 	rand.Seed(time.Now().UnixNano())
 
-	fmt.Println("Opening source database (read-only)...")
-	sourceDb, err := sql.Open("sqlite3", sourceDbPath+"?mode=ro")
+	fmt.Println("Opening source Pebble store...")
+	logger := GetStoreLogger()
+	sourceStore, err := pebblestore.NewPebbleStore(logger, sourceDbPath)
 	if err != nil {
-		return fmt.Errorf("failed to open source database: %w", err)
+		return fmt.Errorf("failed to open source store: %w", err)
 	}
-	defer sourceDb.Close()
+	defer sourceStore.Close()
 
 	// Load block pool into memory
-	if err := loadBlockPool(sourceDb); err != nil {
+	if err := loadBlockPool(sourceStore); err != nil {
 		return err
 	}
 
@@ -561,12 +542,13 @@ func RunBlockReplicator(sourceDbPath, targetDbPath string, numBlocks int) error 
 		return fmt.Errorf("failed to initialize target database: %w", err)
 	}
 	defer func() {
-		if targetFollowEventsCancel != nil {
-			targetFollowEventsCancel()
-		}
 		if targetPushIterator != nil {
 			targetPushIterator.Close()
 		}
+		if targetFollowEventsCancel != nil {
+			targetFollowEventsCancel()
+		}
+		targetFollowEventsWG.Wait()
 		if targetStore != nil {
 			targetStore.Close()
 		}
