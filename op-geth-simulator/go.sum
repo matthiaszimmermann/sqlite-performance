@@ -4,6 +4,8 @@ github.com/Arkiv-Network/pebble-bitmap-store v0.0.0-20260311162351-c3f1b2b64582 
 github.com/Arkiv-Network/pebble-bitmap-store v0.0.0-20260311162351-c3f1b2b64582/go.mod h1:KsTtXxsNUniTNXtY6HldkRMMwbDlXI0JNR0GzQeTWPI=
 github.com/Arkiv-Network/pebble-bitmap-store v0.0.1 h1:NdJIFSd9T3XmUmNljd94N2QWgW5qaeL4Yp/19dTSJPw=
 github.com/Arkiv-Network/pebble-bitmap-store v0.0.1/go.mod h1:KsTtXxsNUniTNXtY6HldkRMMwbDlXI0JNR0GzQeTWPI=
+github.com/Arkiv-Network/pebble-bitmap-store v0.0.4-0.20260317165027-eb6ec04167b3 h1:toWuhIccEHpsMYBdWPM9N0wATwEcFpaHtKAt7CRZnrM=
+github.com/Arkiv-Network/pebble-bitmap-store v0.0.4-0.20260317165027-eb6ec04167b3/go.mod h1:KsTtXxsNUniTNXtY6HldkRMMwbDlXI0JNR0GzQeTWPI=
 github.com/DataDog/zstd v1.4.5 h1:EndNeuB0l9syBZhut0wns3gV1hL8zX8LIu6ZiVHWLIQ=
 github.com/DataDog/zstd v1.4.5/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=
