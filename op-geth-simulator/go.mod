@@ -4,10 +4,9 @@ go 1.25.4
 
 require (
 	github.com/Arkiv-Network/arkiv-events v0.0.4
-	github.com/Arkiv-Network/pebble-bitmap-store v0.0.4-0.20260317165027-eb6ec04167b3
+	github.com/Arkiv-Network/pebble-bitmap-store v0.0.5
 	github.com/ethereum/go-ethereum v1.16.7
 	github.com/gorilla/mux v1.8.1
-	github.com/mattn/go-sqlite3 v1.14.33
 )
 
 require (
