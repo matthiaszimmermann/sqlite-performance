@@ -18,8 +18,8 @@ import (
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
 	"github.com/Arkiv-Network/arkiv-events/events"
-	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store/pebblestore"
-	"github.com/Arkiv-Network/pebble-bitmap-store/pusher"
+	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store-notemp/pebblestore"
+	"github.com/Arkiv-Network/pebble-bitmap-store-notemp/pusher"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 )
@@ -68,7 +68,7 @@ func generateNewEntityKey() []byte {
 func readAllSourcePayloads(sourceStore *pebblestore.PebbleStore) ([]PayloadData, error) {
 	ctx := context.Background()
 
-	lastBlock, err := sourceStore.GetLastBlock(ctx)
+	lastBlock, err := sourceStore.GetLastBlock()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get source last block: %w", err)
 	}

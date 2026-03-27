@@ -11,7 +11,7 @@ import (
 	"time"
 
 	arkivevents "github.com/Arkiv-Network/arkiv-events"
-	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store/pebblestore"
+	pebblestore "github.com/Arkiv-Network/pebble-bitmap-store-notemp/pebblestore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 )
@@ -309,10 +309,8 @@ func GetCurrentBlockNumber() int64 {
 		return 1
 	}
 
-	ctx := context.Background()
-
 	// Use NewQueries.GetLastBlock to get current block number
-	block, err := s.GetLastBlock(ctx)
+	block, err := s.GetLastBlock()
 	if err != nil {
 		return 1
 	}
