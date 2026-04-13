@@ -2,6 +2,8 @@ github.com/Arkiv-Network/arkiv-events v0.0.4 h1:8WWhhVMHIkBIn1fAst/qH4Sl3KBVvrEr
 github.com/Arkiv-Network/arkiv-events v0.0.4/go.mod h1:LaYW4FqA95Rhp/SKTAF8+FEK7cazJDRBXPXl7I90NRc=
 github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.4 h1:hNtU7ZsCmR3zuqTOzpxmnbTNKGygzJqa3ipDhzIFemM=
 github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.4/go.mod h1:2UBtGbV50QY87yTu68LjbCUP/nHQMjjhsHBU0d4fgkQ=
+github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.5-0.20260410125634-2fe2774f7df8 h1:peDgg+B/oa1tW+okmoGPuocVIBUZt4oXW3U7szfOH0s=
+github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.5-0.20260410125634-2fe2774f7df8/go.mod h1:2UBtGbV50QY87yTu68LjbCUP/nHQMjjhsHBU0d4fgkQ=
 github.com/DataDog/zstd v1.4.5 h1:EndNeuB0l9syBZhut0wns3gV1hL8zX8LIu6ZiVHWLIQ=
 github.com/DataDog/zstd v1.4.5/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
 github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1Xbatp0=

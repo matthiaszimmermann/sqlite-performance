@@ -4,7 +4,7 @@ go 1.25.4
 
 require (
 	github.com/Arkiv-Network/arkiv-events v0.0.4
-	github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.4
+	github.com/Arkiv-Network/pebble-bitmap-store-notemp v0.0.5-0.20260410125634-2fe2774f7df8
 	github.com/ethereum/go-ethereum v1.16.7
 	github.com/gorilla/mux v1.8.1
 )
